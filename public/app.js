@@ -16,6 +16,10 @@ const sendBtn = $('#send');
 const statusEl = $('#status');
 const sessionsEl = $('#sessions');
 const chatTitle = $('#chatTitle');
+const micBtn = $('#mic');
+const cwrapEl = $('#cwrap');
+const barsEl = $('#bars');
+const lmsgEl = $('#lmsg');
 
 const T = { sid: null, turn: null, ctl: null, busy: false, follow: null };
 let CFG = {};
@@ -215,6 +219,8 @@ function newTurn(live) {
   const t = {
     root, acts, head, actsBody: body, answerEl: answer, cardsEl: cards, followsEl: follows,
     parts: new Map(), order: [], userMsgs: new Set(), userText: '',
+    // 回放用：这一轮含哪些 assistant 消息，卡片按锚点消息 ID 找到自己的轮次
+    msgIds: new Set(),
     live, running: live, startedAt: Date.now(), endedAt: 0,
     open: false, manual: false, openRows: new Set(), override: null, pendings: new Map(),
   };
@@ -353,7 +359,7 @@ function paintActs(t, aid) {
 const LEVEL_NAME = { L: '低危', M: '中危', H: '高危', C: '严重', X: '校验未过' };
 const DEC_NAME = { allow: '放行', confirm: '待确认', deny: '拦截' };
 
-function addGateCard(t, g) {
+function addGateCard(t, g, replay) {
   const card = el('div', 'gate lv-' + g.level);
   const h = el('div', 'gate-h');
   h.append(el('span', 'lv', `${g.level} ${LEVEL_NAME[g.level] || ''}`));
@@ -367,15 +373,22 @@ function addGateCard(t, g) {
   b.append(ul);
 
   if (g.decision === 'confirm') {
-    const pend = el('div', 'gate-act');
-    const yes = el('button', null, '确认执行');
-    const no = el('button', 'ghost', '取消');
-    yes.type = 'button'; no.type = 'button';
-    pend.append(yes, no);
-    yes.onclick = () => decide(t, g.pendingId, 'approve', card, pend);
-    no.onclick = () => decide(t, g.pendingId, 'reject', card, pend);
-    b.append(pend);
-    b.append(el('div', 'pend', `待确认编号 ${g.pendingId} · 5 分钟内有效`));
+    if (replay) {
+      // 回放不给按钮：pendingId 只有 5 分钟有效，现在点也只会报「已失效」。
+      // 当时真点过的话 /api/confirm 落了 resolve，settleGateCard 会把它改成终态。
+      b.append(el('div', 'pend', `待确认编号 ${g.pendingId} · 已失效`));
+      t.pendings.set(g.pendingId, card);
+    } else {
+      const pend = el('div', 'gate-act');
+      const yes = el('button', null, '确认执行');
+      const no = el('button', 'ghost', '取消');
+      yes.type = 'button'; no.type = 'button';
+      pend.append(yes, no);
+      yes.onclick = () => decide(t, g.pendingId, 'approve', card, pend);
+      no.onclick = () => decide(t, g.pendingId, 'reject', card, pend);
+      b.append(pend);
+      b.append(el('div', 'pend', `待确认编号 ${g.pendingId} · 5 分钟内有效`));
+    }
   } else if (g.decision === 'deny') {
     b.append(el('div', 'pend', '本次不上发任何指令到 IoT 网关，事件已记入安全审计'));
   } else {
@@ -385,6 +398,17 @@ function addGateCard(t, g) {
   t.cardsEl.append(card);
   scrollBottom();
   return card;
+}
+
+// 待确认卡转终态。实时点击和回放走同一条路，两边的文案不会漂
+function settleGateCard(t, card, pendingId, decision, out) {
+  card.querySelector('.gate-act')?.remove();
+  card.querySelector('.dec').textContent = decision === 'approve' ? '已确认' : '已取消';
+  const old = card.querySelector('.pend');
+  if (old) old.textContent = decision === 'approve'
+    ? `已确认执行（编号 ${pendingId}）`
+    : `用户取消，未下发任何指令（编号 ${pendingId}）`;
+  if (decision === 'approve' && out) addExecCard(t, out);
 }
 
 async function decide(t, pendingId, decision, card, actBox) {
@@ -398,13 +422,7 @@ async function decide(t, pendingId, decision, card, actBox) {
     });
     const out = await r.json();
     if (!r.ok) throw new Error(out.error || 'HTTP ' + r.status);
-    card.querySelector('.dec').textContent = decision === 'approve' ? '已确认' : '已取消';
-    actBox.remove();
-    const old = card.querySelector('.pend');
-    if (old) old.textContent = decision === 'approve'
-      ? `已确认执行（编号 ${pendingId}）`
-      : `用户取消，未下发任何指令（编号 ${pendingId}）`;
-    if (decision === 'approve') addExecCard(t, out);
+    settleGateCard(t, card, pendingId, decision, decision === 'approve' ? out : null);
     // 待确认那一轮结束时状态栏是「等待确认」。点完按钮这一轮才算真的收尾，状态栏要跟着走，
     // 否则确认完了还写着「等待确认」，看起来像卡住了。
     setStatus('done', decision === 'approve' ? '已完成' : '已取消');
@@ -604,7 +622,12 @@ function handleEvent(ev, d, t) {
     case 'message.part.delta':
     case 'message.delta': {
       const delta = d?.delta ?? d?.text ?? '';
-      if (delta) upsert(t, { ...(d?.part || {}), id: d?.partID || d?.partId || d?.part?.id, type: d?.part?.type || 'text' }, true, delta);
+      // 增量帧只带 partID，不带 part.type，别在这里补 'text'。
+      // upsert 见到 type 就写回记录，补一个 'text' 会把 message.part.updated 早先
+      // 标好的 'reasoning' 覆盖掉，思考过程就变成了候选正文；而它比正文长，
+      // answerId 取最长的 text part，于是整段思考被渲染成回答。
+      // 不传 type 时 upsert 只在新建记录时默认 text，后续 updated 帧仍能纠正。
+      if (delta) upsert(t, { ...(d?.part || {}), id: d?.partID || d?.partId || d?.part?.id, type: d?.part?.type }, true, delta);
       break;
     }
     // 服务端摘掉 iot 代码块之后的正文，覆盖原来那段
@@ -713,17 +736,18 @@ function stopFollow() {
   if (T.follow) { clearInterval(T.follow); T.follow = null; }
 }
 
-// 历史里读不回「闸门 → 执行」那一段：那是本编排层的事件，不在平台消息里。
-// 审计视图承担了这部分，所以回放只还原对话本身。
+// 历史回放。平台消息里只有正文、思考与工具调用，「闸门 → 下发 → 结果」那几张卡
+// 是本编排层的事件，服务端另存在 cards.jsonl 里，跟消息一起返回。
+// 靠消息 ID 挂回各自的轮次，还原当初看到的样子。
 async function renderHistory(sid) {
   streamEl.innerHTML = '';
   wrap = null;
   ensureWrap();
 
-  let items = [];
+  let items = [], cards = [];
   try {
     const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/events');
-    ({ data: items = [] } = await r.json());
+    ({ data: items = [], cards = [] } = await r.json());
   } catch { setStatus('err', '读取失败'); }
 
   // 一个回合在历史里是连着的好几条 assistant 消息，必须并成一个气泡
@@ -749,13 +773,44 @@ async function renderHistory(sid) {
       turn.startedAt = tm.created || Date.now();
     } else if (tm.created) turn.startedAt = Math.min(turn.startedAt, tm.created);
     if (tm.completed) turn.endedAt = Math.max(turn.endedAt, tm.completed);
+    // 卡片落盘时挂在这一轮的消息 ID 上，这里把这一轮的消息 ID 全收进来
+    if (it?.info?.id) turn.msgIds.add(it.info.id);
+    for (const p of parts) if (p.messageID) turn.msgIds.add(p.messageID);
     if (!keep.length) continue;
     for (const p of keep) upsert(turn, p, false);
   }
   for (const t of turns) paint(t);
+  replayCards(turns, cards);
   scrollBottom();
   const last = items[items.length - 1];
   return !!last && last?.info?.role === 'assistant' && !last?.info?.time?.completed;
+}
+
+// 把落盘的卡片贴回各自的轮次。
+// 挂载靠消息 ID：那一轮最后一条 assistant 消息，平台历史里是同一个 ID，
+// 不用时间戳对齐（本地与平台时钟不同源，猜不准）。
+function replayCards(turns, recs) {
+  const turnOfMsg = new Map();
+  for (const t of turns) for (const id of t.msgIds) turnOfMsg.set(id, t);
+
+  const resolves = [];
+  for (const rec of recs) {
+    if (rec.type === 'cards') {
+      const t = turnOfMsg.get(rec.msgId);
+      if (!t) continue;
+      for (const r of rec.cards || []) {
+        if (r.event === 'demo.gate') addGateCard(t, r.data, true);
+        else if (r.event === 'demo.exec') addExecCard(t, r.data);
+        else if (r.event === 'demo.repair') addRepairCard(t, r.data);
+      }
+    } else if (rec.pendingId) resolves.push(rec);
+  }
+
+  // 确认/取消要等闸门卡都放好了再改，且必须晚于上面那轮循环
+  for (const rec of resolves) {
+    const t = turns.find((x) => x.pendings.has(rec.pendingId));
+    if (t) settleGateCard(t, t.pendings.get(rec.pendingId), rec.pendingId, rec.decision, rec.out);
+  }
 }
 
 /* ================= 会话列表 ================= */
@@ -962,6 +1017,251 @@ $('#sessFind').oninput = paintSessions;
 
 for (const b of document.querySelectorAll('.nav button')) b.onclick = () => switchView(b.dataset.view);
 
+/* ================= 语音输入（按住说话） ================= */
+
+// 百度短语音识别要 16k 单声道 16-bit 小端 PCM，所以这里不用 MediaRecorder：
+// 它出的是 webm/opus，百度不认，还得在服务端装 ffmpeg 转。改成把 AudioContext 定在
+// 16000 Hz，用 AudioWorklet 抓原始浮点采样，自己量化成 Int16 裸发，服务端零依赖。
+const MIC = { on: false, want: false, busy: false, chunks: [], ctx: null, stream: null, rate: 16000, t0: 0, timer: 0, raf: 0, peak: 0, shown: 0, flash: 0 };
+const MIC_MAX_SEC = 55; // 百度上限 60 秒，留点余量，到点自动收
+
+const TAP_WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch && ch.length) this.port.postMessage(new Float32Array(ch));
+    return true;
+  }
+}
+registerProcessor('tap', Tap);
+`;
+
+/* ---------- 输入栏里的录音反馈 ---------- */
+// 长按时视线在输入框上，所以「正在录」这件事做进输入栏：边框转红 + 一条电平条。
+// 电平条取的是真实采样，不是装饰动画——它同时回答「麦克风到底有没有收到我的声音」，
+// 这是纯计时器给不了的。
+
+const BAR_N = 30;               // 30 根柱子，按帧推进，约 1 秒的可视历史
+const barEls = [];
+for (let i = 0; i < BAR_N; i++) {
+  const b = document.createElement('i');
+  b.style.setProperty('--i', i); // 转写态的扫描延迟靠它，省 30 条 nth-child
+  barsEl.appendChild(b);
+  barEls.push(b);
+}
+const levels = new Array(BAR_N).fill(0);
+
+// worklet 每 8ms 推一块 128 采样进来，逐块画太密（125 次/秒），
+// 这里只累积峰值，交给 rAF 按帧取走。
+function meterSample(buf) {
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+  const rms = Math.sqrt(s / buf.length);
+  if (rms > MIC.peak) MIC.peak = rms;
+}
+
+function meterStop() {
+  if (MIC.raf) { cancelAnimationFrame(MIC.raf); MIC.raf = 0; }
+  MIC.peak = 0;
+  MIC.shown = 0;
+  levels.fill(0);
+  for (const b of barEls) b.style.transform = 'scaleY(.06)';
+}
+
+function meterStart() {
+  let last = 0;
+  const tick = (now) => {
+    MIC.raf = requestAnimationFrame(tick);
+    if (now - last < 33) return; // 30fps 够了，省一半写入
+    last = now;
+
+    // RMS 按 dB 映射更贴合听感。窗口取 -52dB（安静房间）到 -10dB（凑近大声说）：
+    // 正常说话的 RMS 大致落在 0.01~0.1，也就是 -40~-20dB，正好在这段的中部，
+    // 起伏才看得出来。窗口开成 -60~0 的话全挤在顶部，电平条看着像一块实心色块。
+    const db = 20 * Math.log10(Math.max(MIC.peak, 1e-6));
+    const lv = Math.min(1, Math.max(0, (db + 52) / 42));
+    MIC.peak = 0;
+    // 起音跟手、回落放慢，柱子不会一闪一闪
+    MIC.shown = lv > MIC.shown ? lv : MIC.shown * 0.72 + lv * 0.28;
+
+    levels.shift();
+    levels.push(MIC.shown);
+    for (let i = 0; i < BAR_N; i++) {
+      barEls[i].style.transform = `scaleY(${Math.max(0.06, levels[i]).toFixed(3)})`;
+    }
+  };
+  MIC.raf = requestAnimationFrame(tick);
+}
+
+// 松手后视线仍在输入栏上，失败原因得在这里闪一下；右上角那行同样太远。
+// 两处都写：这里是即时的，右上角是不随时间消失的持久状态。
+function micFlash(msg, ms = 2000) {
+  clearTimeout(MIC.flash);
+  micPaint('');
+  cwrapEl.classList.add('err');
+  lmsgEl.textContent = msg;
+  setStatus('err', msg);
+  MIC.flash = setTimeout(() => {
+    cwrapEl.classList.remove('err');
+    lmsgEl.textContent = '';
+  }, ms);
+}
+
+function micPaint(state) {
+  // 上一次的错误提示可能还没到点，开始录音就先撤掉它，
+  // 否则 .err 的样式会把电平条一起藏了
+  if (state === 'rec') { clearTimeout(MIC.flash); cwrapEl.classList.remove('err'); }
+  micBtn.classList.toggle('rec', state === 'rec');
+  micBtn.classList.toggle('wait', state === 'wait');
+  cwrapEl.classList.toggle('rec', state === 'rec');
+  cwrapEl.classList.toggle('wait', state === 'wait');
+  if (state === 'rec') meterStart();
+  else meterStop();
+  // rec 态下的秒数由 startRec 的计时器写，这里别覆盖
+  if (state === 'wait') lmsgEl.textContent = '转写中…';
+  else if (state !== 'rec') lmsgEl.textContent = '';
+}
+
+const stopTracks = (s) => { try { s?.getTracks().forEach((t) => t.stop()); } catch {} };
+
+// 浮点采样量化成 16-bit 小端。AudioContext 一般会照 16000 建；万一浏览器没照办，
+// 就按比例抽点降采样。演示够用，不做抗混叠滤波。
+function toPcm16(chunks, srcRate) {
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const flat = new Float32Array(total);
+  let o = 0;
+  for (const c of chunks) { flat.set(c, o); o += c.length; }
+
+  const ratio = srcRate === 16000 ? 1 : 16000 / srcRate;
+  const n = Math.floor(total * ratio);
+  const out = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = flat[ratio === 1 ? i : Math.min(total - 1, Math.round(i / ratio))];
+    const v = x < -1 ? -1 : x > 1 ? 1 : x;
+    out[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+  }
+  return out;
+}
+
+async function startRec() {
+  if (MIC.on || MIC.busy || T.busy || micBtn.disabled) return;
+  MIC.want = true;
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
+    });
+  } catch (e) {
+    MIC.want = false;
+    setStatus('err', '麦克风不可用，检查浏览器权限');
+    console.warn('[mic]', e);
+    return;
+  }
+  // 首次授权弹窗还没点完人就松手了，直接收摊
+  if (!MIC.want) { stopTracks(stream); return; }
+
+  let ctx;
+  try {
+    ctx = new AudioContext({ sampleRate: 16000 });
+    const url = URL.createObjectURL(new Blob([TAP_WORKLET], { type: 'text/javascript' }));
+    try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+
+    const node = new AudioWorkletNode(ctx, 'tap');
+    node.port.onmessage = (e) => {
+      if (!MIC.on) return;
+      MIC.chunks.push(e.data);
+      meterSample(e.data);
+    };
+    ctx.createMediaStreamSource(stream).connect(node);
+    // worklet 不接到 destination 就不会被拉取；接一个零增益节点，顺便避免麦克风回放
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    node.connect(mute).connect(ctx.destination);
+  } catch (e) {
+    stopTracks(stream);
+    try { await ctx?.close(); } catch {}
+    MIC.want = false;
+    setStatus('err', '录音初始化失败：' + String(e.message || e));
+    return;
+  }
+
+  MIC.stream = stream;
+  MIC.ctx = ctx;
+  MIC.chunks = [];
+  MIC.rate = ctx.sampleRate;
+  MIC.on = true;
+  MIC.t0 = Date.now();
+  micPaint('rec');
+
+  // 秒数写在输入栏的电平条旁边，不再写右上角——那里离视线太远，长按的人看不见。
+  // 右上角只留一个静态的「录音中」，免得状态区谎报「空闲」。
+  clearInterval(MIC.timer);
+  MIC.timer = setInterval(() => {
+    const s = (Date.now() - MIC.t0) / 1000;
+    if (s >= MIC_MAX_SEC) { stopRec(); return; }
+    lmsgEl.textContent = s.toFixed(1) + 's';
+  }, 100);
+  lmsgEl.textContent = '0.0s';
+  setStatus('on', '录音中');
+}
+
+async function stopRec() {
+  if (!MIC.on) { MIC.want = false; return; }
+  MIC.on = false;
+  MIC.want = false;
+  clearInterval(MIC.timer);
+
+  const { rate, chunks } = MIC;
+  stopTracks(MIC.stream);
+  try { await MIC.ctx?.close(); } catch {}
+  MIC.stream = null; MIC.ctx = null; MIC.chunks = [];
+  micPaint('');
+
+  const pcm = toPcm16(chunks, rate);
+  if (pcm.length < 16000 * 2 * 0.3) { micFlash('说得太短，按住多说一会儿'); return; }
+
+  MIC.busy = true;
+  micPaint('wait');
+  // micFlash 已经负责收尾，失败路径别再调 micPaint('')——那会把刚写上的错误文字擦掉
+  let failed = false;
+  try {
+    const res = await fetch('/api/asr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/pcm;rate=16000' },
+      body: pcm,
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+    const text = String(j.text || '').trim();
+    if (!text) { failed = true; micFlash('没听清，再说一次'); return; }
+    // 只回填不自动发送：转写可能差一两个字，演示时让人先看一眼再发
+    inputEl.value = inputEl.value ? inputEl.value + text : text;
+    inputEl.dispatchEvent(new Event('input'));
+    inputEl.focus();
+    setStatus('', '已转写，确认后发送');
+  } catch (e) {
+    failed = true;
+    micFlash(String(e.message || e));
+  } finally {
+    MIC.busy = false;
+    if (!failed) micPaint('');
+  }
+}
+
+micBtn.addEventListener('pointerdown', (e) => {
+  if (micBtn.disabled) return;
+  e.preventDefault();
+  micBtn.setPointerCapture?.(e.pointerId);
+  startRec();
+});
+for (const ev of ['pointerup', 'pointercancel']) {
+  micBtn.addEventListener(ev, () => { if (MIC.on || MIC.want) stopRec(); });
+}
+// 切走标签页时别把录音漏在那儿。只在真的录起来之后才响应，
+// 否则首次的授权弹窗会让窗口失焦，把录音当场掐掉。
+window.addEventListener('blur', () => { if (MIC.on) stopRec(); });
+
 /* ================= 启动 ================= */
 
 (async () => {
@@ -974,6 +1274,11 @@ for (const b of document.querySelectorAll('.nav button')) b.onclick = () => swit
     $('#srcSummary').textContent = CFG.source.summary;
     // 设备清单有两份（demo / real），演示和联调的判断结果不一样，界面上必须看得见当前是哪份
     $('#iotLine').textContent = `IoT 网关 ${CFG.iot?.mode === 'mock' ? '（本地 mock）' : '（真实环境）'} · homeId ${CFG.iot?.homeId ?? ''} · 清单 ${CFG.iot?.fixture === 'real' ? '真实快照' : '演示'}`;
+    // 没配 ASR Key 就把麦克风置灰，不要让人按下去才看到报错
+    if (!CFG.voice?.enabled) {
+      micBtn.disabled = true;
+      micBtn.title = '未配置 ASR Key（.env 里的 ASR_API_KEY）';
+    }
   } catch {}
   showEmpty();
   loadSessions();

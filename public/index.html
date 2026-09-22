@@ -47,8 +47,21 @@
       </header>
       <div class="stream" id="stream"></div>
       <form class="composer" id="form">
-        <div class="cwrap">
-          <textarea id="input" rows="1" placeholder="说一句话…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <div class="cwrap" id="cwrap">
+          <div class="cfield">
+            <textarea id="input" rows="1" placeholder="说一句话…（Enter 发送，Shift+Enter 换行）"></textarea>
+            <div class="listen" aria-hidden="true">
+              <span class="ldot"></span>
+              <span class="bars" id="bars"></span>
+              <span class="lmsg" id="lmsg"></span>
+            </div>
+          </div>
+          <button class="mic" id="mic" type="button" title="按住说话" aria-label="按住说话">
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <path d="M12 3.2a2.9 2.9 0 0 0-2.9 2.9v6.2a2.9 2.9 0 0 0 5.8 0V6.1A2.9 2.9 0 0 0 12 3.2z" fill="currentColor"/>
+              <path d="M5.4 11.2a6.6 6.6 0 0 0 13.2 0M12 17.8V21" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            </svg>
+          </button>
           <button class="send" id="send" type="submit">↑</button>
         </div>
       </form>

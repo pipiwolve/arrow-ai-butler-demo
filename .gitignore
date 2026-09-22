@@ -5,6 +5,7 @@ node_modules/
 *.log
 state.json
 audit.jsonl
+cards.jsonl
 .brief/
 
 # 客户资料，勿提交。本仓库只放代码与自写文档。

@@ -10,6 +10,7 @@
 //   GET  /api/config                场景配置
 //   GET  /api/bootstrap             上传资料 + 建 Agent（结果缓存进 state.json）
 //   POST /api/ask                   {text, sessionId?}  建会话或续问，SSE 回传
+//   POST /api/asr                   裸 PCM（16k / 单声道 / 16-bit）→ 百度短语音识别 → 文本
 //   POST /api/confirm               {pendingId, decision} 高危动作的二次确认
 //   GET  /api/sessions              本场景的会话列表
 //   GET  /api/sessions/:id/events   某会话的完整消息历史
@@ -23,7 +24,9 @@ import path from 'node:path';
 import { SCENARIO, DEVICES, ROOT, FIXTURE_NAME } from './scenario.mjs';
 import { createGate } from './src/policy.mjs';
 import { createAudit } from './src/audit.mjs';
+import { createJournal } from './src/journal.mjs';
 import { createIotClient } from './src/iot-client.mjs';
+import { createAsrClient } from './src/asr-client.mjs';
 import { loadEnv } from './src/env.mjs';
 import { writeBrief, CATEGORY_NAME } from './src/agent-brief.mjs';
 import { createGateway } from './iot/mock-gateway.mjs';
@@ -41,6 +44,11 @@ const IOT_MODE = ENV.IOT_MODE || 'mock';
 const IOT_PORT = Number(ENV.IOT_PORT || 18899);
 if (!KEY) throw new Error('.env 里没有 DUMATE_API_KEY');
 
+// 语音是可选的：没配 Key 也要能起服务，只有按下麦克风时 /api/asr 才报「未配置」，
+// 文字对话与整套演示不受影响。
+const ASR_KEY = ENV.ASR_API_KEY || '';
+const ASR_DEV_PID = Number(ENV.ASR_DEV_PID || 80001);
+
 // ---------- 本地状态 ----------
 const readJson = (f, dflt) => {
   try { return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : dflt; } catch { return dflt; }
@@ -50,6 +58,8 @@ const readState = () => readJson(STATE_FILE, {});
 const writeState = (s) => writeJson(STATE_FILE, s);
 
 const audit = createAudit(path.join(ROOT, 'audit.jsonl'));
+// 闸门卡、执行卡、报修卡的回放流水。平台消息里没有这三段，只能自己落盘
+const journal = createJournal(path.join(ROOT, 'cards.jsonl'));
 const gate = createGate({ scenario: SCENARIO, devices: DEVICES.devices });
 
 // ---------- IoT 网关 ----------
@@ -66,6 +76,15 @@ const iot = createIotClient({
   token: IOT_MODE === 'mock' ? (ENV.IOT_TOKEN || 'demo-token') : ENV.IOT_TOKEN,
   appPlatform: SCENARIO.iot.appPlatform,
   deviceSystemPlatform: SCENARIO.iot.deviceSystemPlatform,
+});
+
+// ---------- 百度短语音识别 ----------
+// 按住说话只是「一句话变文字」，识别完回填输入框，发不发由用户决定。
+// 转写不进审计：审计记的是对设备的控制与场景操作，语音本身不是控制动作。
+const asr = createAsrClient({
+  apiKey: ASR_KEY,
+  devPid: ASR_DEV_PID,
+  cuid: ENV.ASR_CUID || 'dumate-arrow-demo',
 });
 
 // ---------- DuMate API ----------
@@ -198,6 +217,9 @@ async function runTurn(sid, text, emit = () => {}) {
 
   let msgSent = false, sawBusy = false, complete = false;
   let answer = '', best = '';
+  // 这一轮最后一条 assistant 消息的 ID。卡片要挂在这个锚点上，回放才能找回来。
+  // 不用时间戳对齐：本地时钟和平台时钟不同源，回放时猜不准。
+  let msgId = '';
   const guard = setTimeout(() => { try { up.body.cancel(); } catch {} }, 12 * 60 * 1000);
 
   try {
@@ -214,6 +236,9 @@ async function runTurn(sid, text, emit = () => {}) {
 
       // 同一段文本既走全量也走增量，取更长的那份，避免重复又不丢字
       const part = payload?.part;
+      if (typeof part?.messageID === 'string') msgId = part.messageID;
+      const info = payload?.info;
+      if (!msgId && info?.role === 'assistant' && typeof info.id === 'string') msgId = info.id;
       if (part?.type === 'text' && typeof part.text === 'string' && part.text.length > best.length) {
         best = part.text;
         answer = best;
@@ -234,7 +259,7 @@ async function runTurn(sid, text, emit = () => {}) {
   } finally {
     clearTimeout(guard);
   }
-  return { complete, answer };
+  return { complete, answer, msgId };
 }
 
 // ---------- 从回答里取结构化动作 ----------
@@ -334,10 +359,43 @@ async function readBody(req) {
   try { return JSON.parse(raw); } catch { return {}; }
 }
 
+// 语音是二进制裸 PCM，不能按 JSON 读
+async function readRawBody(req, limit = 4 * 1024 * 1024) {
+  const chunks = [];
+  let n = 0;
+  for await (const c of req) {
+    n += c.length;
+    if (n > limit) throw new Error('音频过大（上限 4MB，约 2 分钟）');
+    chunks.push(c);
+  }
+  return Buffer.concat(chunks);
+}
+
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(body);
+}
+
+// ---------- POST /api/asr ----------
+// 浏览器按住说话采到的是 16k 单声道 16-bit 小端裸 PCM，这里原样转给百度，不做格式转换。
+// 走文档推荐的裸 PCM 路径，省掉百度那侧的解码，也省掉本地的 ffmpeg。
+async function handleAsr(req, res) {
+  const rate = Number(req.headers['x-audio-rate'] || 16000);
+  let pcm;
+  try {
+    pcm = await readRawBody(req);
+  } catch (e) {
+    return sendJson(res, 413, { error: String(e.message || e) });
+  }
+  try {
+    const r = await asr.recognize(pcm, { rate });
+    console.log(`[asr] ${pcm.length}B ${r.ms}ms :: ${r.text.slice(0, 40) || '(空)'}`);
+    return sendJson(res, 200, { text: r.text, ms: r.ms, sn: r.sn });
+  } catch (e) {
+    console.error('[asr]', e.message);
+    return sendJson(res, 400, { error: String(e.message || e) });
+  }
 }
 
 // ---------- POST /api/ask ----------
@@ -356,6 +414,9 @@ async function handleAsk(req, res) {
     'X-Accel-Buffering': 'no',
   });
   const toClient = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  // 卡片边推边攒，一轮收尾时整批落盘。只推不存，这几张卡回看历史时就没了
+  const cards = [];
+  const card = (type, data) => { cards.push({ event: type, data }); toClient(type, data); };
 
   toClient('demo.session', { sessionId: sid, agentId: st.agentId, resumed: !!sessionId });
   console.log(`[ask] ${sessionId ? 'resume' : 'new'} ${sid} :: ${q.slice(0, 50)}`);
@@ -363,13 +424,18 @@ async function handleAsk(req, res) {
   let aborted = false;
   req.on('close', () => { aborted = true; });
 
+  let msgId = '';
   try {
-    const { complete, answer } = await runTurn(sid, q, (t, d) => { if (!aborted) toClient(t, d); });
+    const r = await runTurn(sid, q, (t, d) => { if (!aborted) toClient(t, d); });
+    const { complete, answer } = r;
+    msgId = r.msgId;
     if (aborted) return;
 
     const { action, clean } = extractAction(answer);
-    // 正文里带 JSON 块不好看，替换成摘掉块之后的文本
-    if (action) toClient('demo.answer', { text: clean });
+    // 正文里带 JSON 块不好看，替换成摘掉块之后的文本。
+    // 无动作的那一轮也要发：前端拿到这个覆盖才不必靠「最长的 text part」猜正文，
+    // 而那个猜法会把思考过程（reasoning，通常比正文长）当成回答。
+    if (clean) toClient('demo.answer', { text: clean });
     if (!action) {
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
@@ -385,13 +451,13 @@ async function handleAsk(req, res) {
         decision: 'EXECUTED', trigger: 'gate-auto', reasons: ['报修引导：只给入口，不对接工单'],
         targets: [], result: 'SUCCEEDED', deeplink: SCENARIO.repair.deeplink[kind],
       });
-      toClient('demo.repair', { kind, deeplink: SCENARIO.repair.deeplink[kind], note: SCENARIO.repair.note });
+      card('demo.repair', { kind, deeplink: SCENARIO.repair.deeplink[kind], note: SCENARIO.repair.note });
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
     }
 
     const verdict = gate.evaluate({ ...action, homeId: action.homeId ?? SCENARIO.iot.homeId });
-    toClient('demo.gate', {
+    card('demo.gate', {
       decision: verdict.decision, level: verdict.level, reasons: verdict.reasons,
       items: verdict.items, pendingId: verdict.pendingId || null,
     });
@@ -413,11 +479,14 @@ async function handleAsk(req, res) {
     }
 
     const out = await execute(verdict, { trigger: 'gate-auto', sessionId: sid });
-    toClient('demo.exec', out);
+    card('demo.exec', out);
     toClient('demo.done', { sessionId: sid, incomplete: !complete });
   } catch (e) {
     if (!aborted) toClient('demo.error', { message: String(e.message || e) });
   } finally {
+    // 落盘放在最后：确认卡那一轮 cards 只有闸门卡，执行卡是用户点确认后才产生的，
+    // 由 /api/confirm 另记一条 resolve，回放时再拼起来。
+    journal.appendTurn({ sessionId: sid, msgId, cards });
     res.end();
   }
 }
@@ -457,12 +526,15 @@ async function handleConfirm(req, res) {
       targets: rec.items, result: 'CANCELLED',
     };
     audit.append(entry);
+    journal.appendResolve({ sessionId, pendingId, decision: 'reject' });
     return sendJson(res, 200, entry);
   }
 
   try {
     const out = await execute(rec, { trigger: 'gate-confirm', sessionId });
     gate.settle(pendingId, out.ok ? 'SUCCEEDED' : 'FAILED');
+    // 回放时靠这条把待确认卡改成「已确认」，并补出确认后才有的那张执行卡
+    journal.appendResolve({ sessionId, pendingId, decision: 'approve', out });
     return sendJson(res, 200, out);
   } catch (e) {
     gate.settle(pendingId, 'FAILED');
@@ -503,6 +575,8 @@ const server = http.createServer(async (req, res) => {
         commands: SCENARIO.commands,
         repair: SCENARIO.repair,
         scenario: SCENARIO.id,
+        // 没配 ASR Key 时前端直接把麦克风置灰，不要让人按下去才看到报错
+        voice: { enabled: !!ASR_KEY },
       });
     }
     if (p === '/api/bootstrap') {
@@ -510,6 +584,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { agentId: st.agentId, version: st.agentVersion, files: st.files });
     }
     if (p === '/api/ask' && req.method === 'POST') return await handleAsk(req, res);
+    if (p === '/api/asr' && req.method === 'POST') return await handleAsr(req, res);
     if (p === '/api/gate/simulate' && req.method === 'POST') return await handleSimulate(req, res);
     if (p === '/api/confirm' && req.method === 'POST') return await handleConfirm(req, res);
 
@@ -522,7 +597,8 @@ const server = http.createServer(async (req, res) => {
     const mHist = p.match(/^\/api\/sessions\/([^/]+)\/events$/);
     if (mHist) {
       const items = await api(`/sessions/${mHist[1]}/events`);
-      return sendJson(res, 200, { data: items });
+      // 卡片与平台消息一起给前端，省一次往返，也避免两边不同步
+      return sendJson(res, 200, { data: items, cards: journal.bySession(mHist[1]) });
     }
 
     // 设备面板：契约字段走真实接口，运行态走 demo 补充接口
