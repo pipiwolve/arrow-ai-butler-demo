@@ -1,0 +1,15 @@
+# 凭证与运行时产物，勿提交
+.env
+.env.local
+node_modules/
+*.log
+state.json
+audit.jsonl
+.brief/
+
+# 客户资料，勿提交。本仓库只放代码与自写文档。
+# 需求书与接口文档是箭牌的文件；devices.real.json 含真实设备序列号，
+# 需要时用 node iot/fetch-devices.mjs 从网关重新抓一份。
+箭牌智家AI 智能助手 需求说明书(1)-0.pdf
+iot接口文档/
+iot/devices.real.json

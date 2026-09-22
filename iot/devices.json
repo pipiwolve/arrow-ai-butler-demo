@@ -1,0 +1,27 @@
+{
+  "_note": "演示用家庭设备清单。deviceName / categoryCode / deviceTagName / onlineStatus 取自箭牌 IoT 接口文档「GET 设备列表」的返回样例；room 与 capability 是 demo 补充字段，真实接口不返回。onlineStatus 为演示态，接口文档样例里 14 台有 13 台离线。",
+  "homeId": 933,
+  "_categoryCode": {
+    "01": "智能坐便器",
+    "02": "智能浴霸",
+    "04": "智能浴缸",
+    "06": "智能镜柜"
+  },
+  "devices": [
+    { "deviceName": "ARROW0117798439048709", "categoryCode": "01", "deviceTagName": "AKB1357智能坐便器", "onlineStatus": 1, "room": "主卫", "capability": ["switch", "switch_watering", "set_water_temp", "switch_valve"] },
+    { "deviceName": "ARROW0117701862667130", "categoryCode": "01", "deviceTagName": "AKB1357智能坐便器", "onlineStatus": 1, "room": "主卫", "capability": ["switch", "switch_watering", "set_water_temp", "switch_valve"] },
+    { "deviceName": "ARROWToilet17419421020631", "categoryCode": "01", "deviceTagName": "AKB1332-P智能坐便器", "onlineStatus": 1, "room": "主卫", "capability": ["switch", "switch_watering", "set_water_temp", "switch_valve"] },
+    { "deviceName": "ARROW0617696743520408", "categoryCode": "06", "deviceTagName": "QN-PRO智能镜柜", "onlineStatus": 1, "room": "主卫", "capability": ["switch"] },
+    { "deviceName": "ARROW0417663939524510", "categoryCode": "04", "deviceTagName": "ACH102智能浴缸", "onlineStatus": 1, "room": "主卫", "capability": ["switch", "switch_valve"] },
+    { "deviceName": "ARROW0217833154885800", "categoryCode": "02", "deviceTagName": "AQW11838-R-AM智能浴霸", "onlineStatus": 1, "room": "主卫", "capability": ["switch", "switch_warm_air", "set_warm_air_temp"] },
+
+    { "deviceName": "ARROWToilet17332949200780", "categoryCode": "01", "deviceTagName": "akb162111", "onlineStatus": 0, "room": "客卫", "capability": ["switch", "switch_watering", "set_water_temp", "switch_valve"] },
+    { "deviceName": "ARROWToilet17419421020634", "categoryCode": "01", "deviceTagName": "AKB1332-111", "onlineStatus": 0, "room": "客卫", "capability": ["switch", "switch_watering", "set_water_temp", "switch_valve"] },
+    { "deviceName": "ARROW0117618953477390", "categoryCode": "01", "deviceTagName": "AKB1621-A-4G智能坐便器", "onlineStatus": 0, "room": "客卫", "capability": ["switch", "switch_watering", "set_water_temp", "switch_valve"] },
+    { "deviceName": "ARROW0117806446927480", "categoryCode": "01", "deviceTagName": "AKB1325-P智能坐便器", "onlineStatus": 0, "room": "客卫", "capability": ["switch", "switch_watering", "set_water_temp", "switch_valve"] },
+    { "deviceName": "ARROW0617696743520409", "categoryCode": "06", "deviceTagName": "QN-PRO智能镜柜", "onlineStatus": 0, "room": "主卫", "capability": ["switch"] },
+    { "deviceName": "ARROW0617696743520403", "categoryCode": "06", "deviceTagName": "QN-PRO智能镜柜", "onlineStatus": 0, "room": "客卫", "capability": ["switch"] },
+    { "deviceName": "ARROW0417663939595190", "categoryCode": "04", "deviceTagName": "ACH102智能浴缸", "onlineStatus": 0, "room": "客卫", "capability": ["switch", "switch_valve"] },
+    { "deviceName": "ARROW0417858242468240", "categoryCode": "04", "deviceTagName": "AL1787SQ轻智能浴缸", "onlineStatus": 0, "room": "客卫", "capability": ["switch", "switch_valve"] }
+  ]
+}

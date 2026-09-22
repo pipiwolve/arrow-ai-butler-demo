@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>箭牌智家 AI 助手</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="side">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="28" height="28"><path d="M4 22 L16 6 L28 22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 26 L16 18 L22 26" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity=".45"/></svg>
+      </span>
+      <div class="bt"><b id="brandProduct">箭牌智家 AI 助手</b><span id="brandVendor">DuMate Agent</span></div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button type="button" data-view="chat" class="on"><i>◈</i>对话</button>
+      <button type="button" data-view="devices"><i>⌂</i>家庭设备<em id="devCount"></em></button>
+      <button type="button" data-view="audit"><i>▤</i>安全审计<em id="auditCount"></em></button>
+    </nav>
+
+    <div class="sec" id="secSessions">
+      <div class="sec-h"><h4>会话历史</h4><button type="button" class="mini" id="btnNew">＋ 新对话</button></div>
+      <input type="search" id="sessFind" class="find" placeholder="搜索会话…" autocomplete="off">
+      <div class="sessions" id="sessions"><div class="hint">加载中…</div></div>
+    </div>
+
+    <div class="sec src">
+      <div class="f" id="srcFile">—</div>
+      <div class="m" id="srcSummary">—</div>
+      <div class="m" id="iotLine">—</div>
+      <span class="tag" id="agentTag">初始化中…</span>
+    </div>
+  </aside>
+
+  <main class="main">
+
+    <section class="view on" id="view-chat">
+      <header class="top">
+        <h1 id="chatTitle">新对话</h1>
+        <div class="status" id="status"><i></i><span>空闲</span></div>
+      </header>
+      <div class="stream" id="stream"></div>
+      <form class="composer" id="form">
+        <div class="cwrap">
+          <textarea id="input" rows="1" placeholder="说一句话…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button class="send" id="send" type="submit">↑</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="view" id="view-devices">
+      <header class="top">
+        <h1>家庭设备</h1>
+        <button type="button" class="mini" id="btnReloadDev">刷新</button>
+      </header>
+      <div class="pane" id="devPane"></div>
+    </section>
+
+    <section class="view" id="view-audit">
+      <header class="top">
+        <h1>安全审计</h1>
+        <button type="button" class="mini" id="btnReloadAudit">刷新</button>
+      </header>
+      <div class="pane" id="auditPane"></div>
+    </section>
+
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
