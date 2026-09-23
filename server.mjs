@@ -48,11 +48,16 @@ import { loadEnv } from './src/env.mjs';
 import { writeBrief, CATEGORY_NAME } from './src/agent-brief.mjs';
 import { createGateway } from './iot/mock-gateway.mjs';
 
-const STATE_FILE = path.join(ROOT, 'state.json');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 // Vercel 上只有 /tmp 可写，仓库目录是只读的。清单是每次现生成、用完就传走，
 // 不需要留在仓库里，所以线上落到 tmpdir 就行。
 const BRIEF_DIR = process.env.VERCEL ? path.join(tmpdir(), 'arrow-brief') : path.join(ROOT, '.brief');
+// 没配 KV 时的兜底目录。本地就是仓库目录（行为与改动前一致）；线上换 tmpdir，
+// 因为往只读的仓库目录写会直接 EACCES 抛出来，把 bootstrap 和每一轮对话都打成 500。
+// 这样兜底之后线上仍能跑，代价是数据只活在本实例里、冷启动即丢 —— 与启动横幅的警告一致。
+// 但要注意：审计留痕是需求点名的东西，客户演示前必须把 KV 配上，别靠这个兜底。
+const FALLBACK_DIR = process.env.VERCEL ? tmpdir() : ROOT;
+const STATE_FILE = path.join(FALLBACK_DIR, 'state.json');
 
 // ---------- env ----------
 const ENV = loadEnv(ROOT);
@@ -71,8 +76,8 @@ const ASR_DEV_PID = Number(ENV.ASR_DEV_PID || 80001);
 // ---------- 存储 ----------
 // 本地写文件，Vercel 上写 KV，由 src/store.mjs 按环境变量选。两者都是异步接口。
 const STATE_STORE = createStore({ name: 'arrow:state', file: STATE_FILE, env: ENV });
-const AUDIT_STORE = createStore({ name: 'arrow:audit', file: path.join(ROOT, 'audit.jsonl'), env: ENV });
-const CARD_STORE = createStore({ name: 'arrow:cards', file: path.join(ROOT, 'cards.jsonl'), env: ENV });
+const AUDIT_STORE = createStore({ name: 'arrow:audit', file: path.join(FALLBACK_DIR, 'audit.jsonl'), env: ENV });
+const CARD_STORE = createStore({ name: 'arrow:cards', file: path.join(FALLBACK_DIR, 'cards.jsonl'), env: ENV });
 
 const readState = () => STATE_STORE.readJson({});
 const writeState = (s) => STATE_STORE.writeJson(s);
