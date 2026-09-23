@@ -1,7 +1,8 @@
-// Vercel 函数入口。所有 /api/* 的请求都落到这里，再交给 server.mjs 的 handler。
+// Vercel 函数入口。请求交给 server.mjs 的 handler，路由表只维护那一份。
 //
-// 为什么用 catch-all 而不是一个路由一个文件：路由表在 server.mjs 里，已经按本地服务写好了，
-// 拆成十几个函数文件等于把同一张表维护两遍。一个入口转一下，本地与线上走的是同一份代码。
+// 这个 catch-all 在当前部署里只接住 /api 后面的一段（/api/config、/api/sessions）。
+// 两段及以上会被边缘直接 404，函数根本不会执行。那些路径各有一个同名文件，
+// 内容只是把本文件再导出一次，例如 api/iot/devices.mjs。
 //
 // 静态资源不走这里 —— vercel.json 里把 public/ 设为输出目录，Vercel 直接发，比过函数快。
 //

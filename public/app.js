@@ -995,7 +995,14 @@ async function loadDevices(quiet) {
   }
 
   let dev = { data: [] }, sc = { data: [] };
-  try { dev = await (await fetch('/api/iot/devices' + (quiet ? '' : '?fresh=1'))).json(); } catch {}
+  try {
+    const r = await fetch('/api/iot/devices' + (quiet ? '' : '?fresh=1'));
+    const text = await r.text();
+    try { dev = JSON.parse(text); } catch { dev = { data: [], error: `HTTP ${r.status} ${text.slice(0, 160)}` }; }
+    if (!r.ok && !dev.error) dev.error = `HTTP ${r.status}`;
+  } catch (e) {
+    dev = { data: [], error: String(e.message || e) };
+  }
   try { sc = await (await fetch('/api/iot/scenes')).json(); } catch {}
 
   box.innerHTML = '';

@@ -1080,8 +1080,19 @@ async function handleLogin(req, res) {
 }
 
 // ---------- 路由 ----------
+function requestUrl(req) {
+  const base = `http://localhost:${PORT}`;
+  const direct = new URL(req.url || '/', base);
+  if (direct.pathname.startsWith('/api/')) return direct;
+  // 嵌套函数有时只带文件名那段，原始路径在这些头里
+  const hinted = ['x-forwarded-uri', 'x-invoke-path', 'x-original-uri', 'x-vercel-original-path']
+    .map((h) => req.headers?.[h])
+    .find((v) => typeof v === 'string' && v.startsWith('/api/'));
+  return hinted ? new URL(hinted, base) : direct;
+}
+
 export async function handler(req, res) {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const url = requestUrl(req);
   const p = url.pathname;
   try {
     if (p === '/api/login' && req.method === 'POST') return await handleLogin(req, res);
