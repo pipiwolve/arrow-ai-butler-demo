@@ -33,8 +33,9 @@ export function createGate({ scenario, devices }) {
     return { level: defaultRiskLevel, label: '默认等级', basis: '未命中任何高危规则' };
   }
 
-  // 单条 cmd 的静态校验。返回 { level, label, basis } 或抛错
-  function inspect(item) {
+  // 单条 cmd 的静态校验。返回 { level, label, basis } 或抛错。
+  // online 是实时在线表（deviceName → boolean）。传入时以它为准，不再看清单里写死的在线列。
+  function inspect(item, online) {
     if (!item || typeof item !== 'object') throw new Error('指令项不是对象');
     // 接口文档里 conditionList 的 time 是可选字段，但它挂在一个完整的设备指令上，
     // 不是独立的时间触发器。「只给 time」的写法网关会拒，先在这里说清楚缺哪个字段。
@@ -55,14 +56,15 @@ export function createGate({ scenario, devices }) {
     if (!allowed.includes(String(item.value))) {
       throw new Error(`参数值非法：${item.param}=${item.value}，可选 ${allowed.join('/')}`);
     }
-    if (!dev.onlineStatus) throw new Error(`设备离线，无法下发：${dev.deviceTagName}${dev.room ? `（${dev.room}）` : ''}`);
+    const on = online ? online.get(item.deviceName) === true : !!dev.onlineStatus;
+    if (!on) throw new Error(`设备离线，无法下发：${dev.deviceTagName}${dev.room ? `（${dev.room}）` : ''}`);
     return { ...riskOf(item), spec, device: dev };
   }
 
   // 评估一个动作。返回 { decision, level, action, items, reasons, pendingId? }
   // dryRun 只判定不留痕：不建待确认记录。诊断调用不该让后续的 /api/confirm 有东西可领，
   // 否则审计里会混进没真实发生过的操作。
-  function evaluate(action, { dryRun = false } = {}) {
+  function evaluate(action, { dryRun = false, online = null } = {}) {
     const reasons = [];
     if (!ACTIONS.has(action?.action)) {
       return { decision: 'deny', level: REJECTED, reasons: [`未授权的动作类型：${action?.action}`] };
@@ -101,7 +103,7 @@ export function createGate({ scenario, devices }) {
       for (const item of list) {
         let info;
         try {
-          info = inspect(item);
+          info = inspect(item, online);
         } catch (e) {
           return { decision: 'deny', level: REJECTED, action: act, reasons: [`${groupName}校验未过：${e.message}`] };
         }

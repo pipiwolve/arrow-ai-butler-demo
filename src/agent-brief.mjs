@@ -26,7 +26,8 @@ export function buildBrief({ scenario, devices }) {
 
   L.push('# 箭牌智家 · 家庭设备与指令清单');
   L.push('');
-  L.push(`本清单由系统生成，是设备的唯一事实来源。下发指令时 deviceName、cmd、param、value 必须逐字使用本文件里的值，不要改写、不要猜测、不要用别的写法。`);
+  L.push(`本清单由系统生成。下发指令时 deviceName、cmd、param、value 必须逐字使用本文件里的值，不要改写、不要猜测、不要用别的写法。`);
+  L.push('表里的「在线」列不是实时状态。用户消息开头的「实时在线」段才是，两者不一致时以后者为准。');
   L.push('');
   L.push(`homeId = ${homeId}`);
   L.push('');

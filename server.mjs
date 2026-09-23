@@ -39,6 +39,7 @@ import { tmpdir } from 'node:os';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { SCENARIO, DEVICES, ROOT, FIXTURE_NAME } from './scenario.mjs';
 import { createGate } from './src/policy.mjs';
+import { slimEvents, inDemoWindow } from './src/history.mjs';
 import { createAudit, redact } from './src/audit.mjs';
 import { createJournal } from './src/journal.mjs';
 import { createStore, storageWarning } from './src/store.mjs';
@@ -102,6 +103,65 @@ const iot = createIotClient({
   appPlatform: SCENARIO.iot.appPlatform,
   deviceSystemPlatform: SCENARIO.iot.deviceSystemPlatform,
 });
+
+// 真实网关的在线态缓存 20 秒。对话、闸门、设备页共用这一份，避免一轮里连打三次列表。
+// mock 模式不走这里，闸门继续用清单里的在线列。
+const LIVE_TTL = 20_000;
+let liveCache = { at: 0, map: null, rows: null, ok: false, error: null, ms: 0 };
+
+// 技能库列表几乎不变（大量内置技能）。缓存 5 分钟，增删改时清掉。
+// 已挂技能的名字另记一份，打开技能页不必按挂载数再逐个打详情。
+const SKILL_TTL = 5 * 60 * 1000;
+const skillListCache = new Map();
+const skillNameCache = new Map();
+function dropSkillCache(id) {
+  skillListCache.clear();
+  if (id) skillNameCache.delete(id);
+}
+
+async function liveDevices(force = false) {
+  if (!force && liveCache.rows && Date.now() - liveCache.at < LIVE_TTL) return liveCache;
+  const started = Date.now();
+  try {
+    const list = await iot.deviceList(SCENARIO.iot.homeId);
+    const rows = Array.isArray(list.response?.data) ? list.response.data : [];
+    const map = new Map();
+    for (const d of rows) if (d?.deviceName) map.set(d.deviceName, !!d.onlineStatus);
+    liveCache = {
+      at: Date.now(), map, rows, ok: !!list.ok, error: list.error || null,
+      ms: list.ms ?? (Date.now() - started),
+    };
+  } catch (e) {
+    if (liveCache.rows) return liveCache;
+    liveCache = {
+      at: Date.now(), map: new Map(), rows: [], ok: false,
+      error: String(e.message || e), ms: Date.now() - started,
+    };
+  }
+  return liveCache;
+}
+
+// 真实模式下闸门只认实时表。接口失败时 map 是空的，全部按离线拦截，不用清单里的演示在线态。
+async function onlineForGate() {
+  if (IOT_MODE !== 'real') return null;
+  const live = await liveDevices();
+  return live.map || new Map();
+}
+
+const ROSTER_MARK = '【用户原话】';
+
+function rosterPrefix(live) {
+  const lines = ['【实时在线】以本段为准，忽略清单文件中的在线列。'];
+  if (!live?.ok) {
+    lines.push(`查询物联网平台失败${live?.error ? `（${live.error}）` : ''}。本轮所有设备按离线处理，不要声称任何设备在线。`);
+  } else {
+    for (const d of DEVICES.devices) {
+      const on = live.map?.get(d.deviceName) === true;
+      lines.push(`- ${d.room ? d.room + ' ' : ''}${d.deviceTagName} ${d.deviceName} ${on ? '在线' : '离线'}`);
+    }
+  }
+  return lines.join('\n') + `\n${ROSTER_MARK}\n`;
+}
 
 // ---------- 百度短语音识别 ----------
 // 按住说话只是「一句话变文字」，识别完回填输入框，发不发由用户决定。
@@ -210,7 +270,9 @@ async function updateAgent(st, patch) {
 // 那种情况下不能直接建新 Agent —— 每冷启动一次就在客户账号里多一个同名 Agent，
 // 演示一上午能攒出十几个。先按名字去列表里找，各项对得上就复用。
 //
-// 能核对的：system 全文、skills 的 {skillID, releaseID}、挂载文件个数。
+// 能核对的：skills 的 {skillID, releaseID}、挂载文件个数。
+// system 全文变了也复用同一条 Agent，回来再把提示词补上去。只因改了一句提示词就新建，
+// agentId 一换，侧栏里的历史会话就对不上了。
 // 核对不了的：文件内容 —— GET 只回 fileID，不回文件名，没法确认挂的是不是当前那份清单。
 // 所以这只是一层兜底，正路是配 KV 让 state.json 真正持久化。
 async function findReusableAgent({ skills, pKey, want, fixtureKey }) {
@@ -225,9 +287,9 @@ async function findReusableAgent({ skills, pKey, want, fixtureKey }) {
   if (!same.length) return null;
 
   const fileCount = agentUploads().length;
-  const hit = same.find((a) => a.system === SCENARIO.agent.system
-    && skillKey(a.skills) === skillKey(skills)
+  const candidates = same.filter((a) => skillKey(a.skills) === skillKey(skills)
     && (a.files || []).length === fileCount);
+  const hit = candidates.find((a) => a.system === SCENARIO.agent.system) || candidates[0];
   if (!hit) {
     console.warn(`[agent] 有 ${same.length} 个同名 Agent，但没有一个与当前配置对得上，新建一个。`
       + `（同名 Agent 会越攒越多，确认无用后可去平台删掉）`);
@@ -251,6 +313,11 @@ async function findReusableAgent({ skills, pKey, want, fixtureKey }) {
   await writeState(next);
   console.log(`[agent] 冷启动：按名字复用已有 Agent ${hit.id}（v${hit.version}）。`
     + `挂载文件内容未能核对（接口只回 fileID），若刚改过资料请访问 /api/bootstrap?force=1 重建。`);
+  if (hit.system !== SCENARIO.agent.system) {
+    const updated = await updateAgent(next, { system: SCENARIO.agent.system });
+    console.log(`[agent] 提示词已写回 ${hit.id} v${updated.agentVersion}`);
+    return updated;
+  }
   return next;
 }
 
@@ -369,7 +436,7 @@ async function* sseEvents(body) {
 }
 
 // ---------- 跑一轮对话 ----------
-async function runTurn(sid, text, emit = () => {}) {
+async function runTurn(sid, text, emit = () => {}, modelText) {
   const up = await fetch(`${BASE}/sessions/${sid}/events/stream`, {
     headers: { Authorization: `Bearer ${KEY}`, Accept: 'text/event-stream' },
   });
@@ -413,7 +480,7 @@ async function runTurn(sid, text, emit = () => {}) {
       if (evType === 'server.connected' && !msgSent) {
         msgSent = true;
         await json(`/sessions/${sid}/events`, 'POST', {
-          events: [{ type: 'user.message', content: [{ type: 'text', text }] }],
+          events: [{ type: 'user.message', content: [{ type: 'text', text: modelText || text }] }],
         }).catch((e) => emit('demo.error', { message: String(e.message) }));
         continue;
       }
@@ -583,8 +650,10 @@ async function listSessions() {
     if (!r?.hasMore || !r.nextCursor) break;
     cursor = r.nextCursor;
   }
+  const epochMs = Date.parse(SCENARIO.demoEpoch || '');
   return all
-    .filter((s) => s.agent?.id === st.agentId && s.metadata?.scenario === SCENARIO.id)
+    .filter((s) => s.agent?.id === st.agentId && s.metadata?.scenario === SCENARIO.id
+      && inDemoWindow(s.createdAt, epochMs))
     .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
 }
 
@@ -592,7 +661,7 @@ async function createSession(title) {
   const st = await bootstrap();
   return json('/sessions', 'POST', {
     agent: { id: st.agentId },
-    metadata: { title: title.slice(0, 60), scenario: SCENARIO.id },
+    metadata: { title: title.slice(0, 60), scenario: SCENARIO.id, demoEpoch: SCENARIO.demoEpoch || '' },
   });
 }
 
@@ -652,6 +721,9 @@ async function handleAsk(req, res) {
 
   const st = await bootstrap();
   const sid = sessionId || (await createSession(q)).id;
+  // 真实在线态写进发给模型的那一条，界面上的用户气泡仍是原话（前端按标记摘掉前缀）。
+  const live = IOT_MODE === 'real' ? await liveDevices() : null;
+  const modelText = live ? rosterPrefix(live) + q : q;
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -680,7 +752,7 @@ async function handleAsk(req, res) {
 
   let msgId = '';
   try {
-    const r = await runTurn(sid, q, (t, d) => { if (!aborted) toClient(t, d); });
+    const r = await runTurn(sid, q, (t, d) => { if (!aborted) toClient(t, d); }, modelText);
     const { complete, answer } = r;
     msgId = r.msgId;
     if (aborted) return;
@@ -716,7 +788,10 @@ async function handleAsk(req, res) {
       return;
     }
 
-    const verdict = gate.evaluate({ ...action, homeId: action.homeId ?? SCENARIO.iot.homeId });
+    const verdict = gate.evaluate(
+      { ...action, homeId: action.homeId ?? SCENARIO.iot.homeId },
+      { online: await onlineForGate() },
+    );
     card('demo.gate', {
       decision: verdict.decision, level: verdict.level, reasons: verdict.reasons,
       items: verdict.items, pendingId: verdict.pendingId || null,
@@ -790,7 +865,10 @@ async function handleSimulate(req, res) {
     return sendJson(res, 400, { error: '请求体要是一个动作对象，例如 {"action":"device.control","targets":[...]}' });
   }
   // dryRun：不建待确认记录，避免诊断调用在审计里留下没真实发生过的操作
-  const verdict = gate.evaluate({ ...action, homeId: action.homeId ?? SCENARIO.iot.homeId }, { dryRun: true });
+  const verdict = gate.evaluate(
+    { ...action, homeId: action.homeId ?? SCENARIO.iot.homeId },
+    { dryRun: true, online: await onlineForGate() },
+  );
   return sendJson(res, 200, {
     decision: verdict.decision, level: verdict.level, reasons: verdict.reasons,
     items: verdict.items || [], dryRun: true,
@@ -816,6 +894,11 @@ async function handleConfirm(req, res) {
   }
 
   try {
+    const again = gate.evaluate(rec.action, { dryRun: true, online: await onlineForGate() });
+    if (again.decision === 'deny') {
+      gate.settle(pendingId, 'FAILED');
+      return sendJson(res, 409, { error: again.reasons.join('；') });
+    }
     const out = await execute(rec, { trigger: 'gate-confirm', sessionId });
     gate.settle(pendingId, out.ok ? 'SUCCEEDED' : 'FAILED');
     // 回放时靠这条把待确认卡改成「已确认」，并补出确认后才有的那张执行卡
@@ -846,6 +929,7 @@ async function handleSkillWrite(req, res, skillId) {
     return sendJson(res, code, { error: e.message });
   }
   console.log(`[skills] ${skillId ? '换源' : '新建'} ${skillId || r?.id} <- ${src}`);
+  dropSkillCache(skillId || r?.id);
   return sendJson(res, 200, r || {});
 }
 
@@ -870,6 +954,7 @@ async function handleSkillZip(req, res, skillId) {
   try { body = JSON.parse(text); } catch { body = text; }
   if (!up.ok) return sendJson(res, up.status, { error: body?.error?.message || body?.message || String(text).slice(0, 300) });
   console.log(`[skills] 传包更新 ${skillId} (${buf.length}B)`);
+  dropSkillCache(skillId);
   return sendJson(res, 200, body || {});
 }
 
@@ -881,9 +966,16 @@ async function agentMounted(st) {
   const mounted = Array.isArray(a?.skills) ? a.skills : [];
   const skills = await Promise.all(mounted.map(async (s) => {
     const id = s.skillID || s.skillId || s.id || '';
+    const cached = skillNameCache.get(id);
+    if (cached && Date.now() - cached.at < SKILL_TTL) {
+      const d = cached.rec;
+      return { skillID: id, releaseID: s.releaseID || d.releaseId || '', name: d.name || id, version: d.version || '', builtin: !!d.builtin };
+    }
     try {
       const d = await api(`/skills/${id}`);
-      return { skillID: id, releaseID: s.releaseID || d.releaseId || '', name: d.name || id, version: d.version || '', builtin: !!d.builtin };
+      const rec = { name: d.name || id, releaseId: d.releaseId || '', version: d.version || '', builtin: !!d.builtin };
+      skillNameCache.set(id, { at: Date.now(), rec });
+      return { skillID: id, releaseID: s.releaseID || rec.releaseId, name: rec.name, version: rec.version, builtin: rec.builtin };
     } catch (e) {
       return { skillID: id, releaseID: s.releaseID || '', name: id, error: String(e.message || e) };
     }
@@ -1041,17 +1133,22 @@ export async function handler(req, res) {
     }
     const mHist = p.match(/^\/api\/sessions\/([^/]+)\/events$/);
     if (mHist) {
-      const items = await api(`/sessions/${mHist[1]}/events`);
-      // 卡片与平台消息一起给前端，省一次往返，也避免两边不同步
-      return sendJson(res, 200, { data: items, cards: await journal.bySession(mHist[1]) });
+      const sid = mHist[1];
+      // 事件和卡片互不依赖。卡片流水失败时仍把正文回放出来，不要整页空白。
+      const [raw, cards] = await Promise.all([
+        api(`/sessions/${sid}/events`),
+        journal.bySession(sid).catch((e) => { console.error('[cards]', e.message); return []; }),
+      ]);
+      const items = Array.isArray(raw) ? raw : (Array.isArray(raw?.data) ? raw.data : []);
+      return sendJson(res, 200, { data: slimEvents(items), cards });
     }
 
     // 设备面板：全部字段走真实接口，room 与品类名是本地补的显示字段
     // 曾经还并一路 demo 补充接口取开关态，列已删，那一路也撤了——真实网关没有这个接口，
     // 留着就是每次开面板都往客户平台发一个必然 404 的请求
     if (p === '/api/iot/devices') {
-      const list = await iot.deviceList(SCENARIO.iot.homeId);
-      const live = Array.isArray(list.response?.data) ? list.response.data : [];
+      const list = await liveDevices(url.searchParams.get('fresh') === '1');
+      const live = list.rows || [];
       const seen = new Set();
       const rows = [];
       const push = (d, onlineStatus) => {
@@ -1077,8 +1174,9 @@ export async function handler(req, res) {
     // 列的是本编排层自己建过的场景，从审计流水里取。真实平台建完场景后返回什么结构
     // 我们没有样本，所以这里只回我们确定发出去的那几个字段，不假装知道平台的回执。
     if (p === '/api/iot/scenes') {
+      const epochMs = Date.parse(SCENARIO.demoEpoch || '');
       const rows = (await audit.tail(500))
-        .filter((e) => e.kind === 'scene.create' && e.result === 'SUCCEEDED')
+        .filter((e) => inDemoWindow(e.at, epochMs) && e.kind === 'scene.create' && e.result === 'SUCCEEDED')
         .map((e) => {
           // 新记录带 scene 分列。早于这次改动的记录只有 targets（条件与动作混在一起），
           // 但条件才带 time 字段、动作从不带，所以按有没有 time 拆就是准的。
@@ -1097,7 +1195,9 @@ export async function handler(req, res) {
 
     if (p === '/api/audit') {
       const limit = Number(url.searchParams.get('limit') || 100);
-      return sendJson(res, 200, { data: await audit.tail(limit) });
+      const epochMs = Date.parse(SCENARIO.demoEpoch || '');
+      const data = (await audit.tail(limit)).filter((e) => inDemoWindow(e.at, epochMs));
+      return sendJson(res, 200, { data });
     }
 
     // ---- 技能管理 ----
@@ -1109,8 +1209,13 @@ export async function handler(req, res) {
       // name / search 会被静默忽略（total 不动），别写错
       const qs = new URLSearchParams({ page, pageSize });
       if (keyword) qs.set('keyword', keyword);
+      const cacheKey = qs.toString();
+      const hit = skillListCache.get(cacheKey);
+      if (hit && Date.now() - hit.at < SKILL_TTL) return sendJson(res, 200, hit.body);
       const r = await api(`/skills?${qs}`);
-      return sendJson(res, 200, { data: r?.data || [], total: r?.total ?? (r?.data || []).length, page: Number(page), pageSize: Number(pageSize) });
+      const body = { data: r?.data || [], total: r?.total ?? (r?.data || []).length, page: Number(page), pageSize: Number(pageSize) };
+      skillListCache.set(cacheKey, { at: Date.now(), body });
+      return sendJson(res, 200, body);
     }
     // 新建。没有 :id，走的是同一段处理，handleSkillWrite 按 skillId 有没有来分新建 / 换源
     if (p === '/api/skills' && req.method === 'POST') return await handleSkillWrite(req, res, '');
@@ -1124,6 +1229,7 @@ export async function handler(req, res) {
       const r = await api(`/skills/${mSkill[1]}`, { method: 'DELETE' });
       console.log(`[skills] 删除 ${mSkill[1]}`);
       wantedSkills = null; // 缓存里可能还留着刚删掉的那个
+      dropSkillCache(mSkill[1]);
       return sendJson(res, 200, r || {});
     }
 

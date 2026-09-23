@@ -34,6 +34,12 @@ const relPath = (s) => String(s ?? '')
   .replace(/^ses_[A-Za-z0-9]+\//, '')
   .replace(/\/{2,}/g, '/');
 const flat = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
+// 服务端把实时在线态写在用户消息前面，界面只留原话。
+const spokenText = (s) => {
+  const raw = String(s ?? '');
+  const i = raw.lastIndexOf('【用户原话】');
+  return i < 0 ? raw : raw.slice(i + '【用户原话】'.length).replace(/^\s+/, '');
+};
 const clip = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + '…' : String(s));
 const plain = (s) => flat(s).replace(/\*\*|__|`|~~/g, '').replace(/^\||\|$/g, '');
 const baseName = (s) => { const p = relPath(s).replace(/\/+$/, ''); return p.split('/').pop() || p; };
@@ -159,10 +165,10 @@ function stepOf(r, live, answerId, t) {
   if (r.type === 'text') {
     if (r.id === answerId) return null;
     // 流里会把用户自己的提问回显成一条 text part，那不是 Agent 的步骤
-    if (t.userMsgs.has(r.messageID) || flat(partText(r)) === t.userText) return null;
-    const txt = plain(partText(r));
+    if (t.userMsgs.has(r.messageID) || flat(spokenText(partText(r))) === t.userText) return null;
+    const txt = plain(spokenText(partText(r)));
     if (!txt) return null;
-    s = { k: 'say', label: clip(txt, 56), raw: partText(r) };
+    s = { k: 'say', label: clip(txt, 56), raw: spokenText(partText(r)) };
   } else if (r.type === 'reasoning') s = { k: 'think', label: '思考', raw: '' };
   else if (r.type === 'subtask' || r.type === 'agent') s = { k: 'task', label: '派子任务', raw: '' };
   else if (r.type === 'sandbox-status') s = { k: 'sandbox', label: r.message || '准备沙箱', raw: '' };
@@ -274,8 +280,10 @@ function answerId(t) {
   for (const id of t.order) {
     const r = t.parts.get(id);
     if (r.type !== 'text') continue;
-    const n = partText(r).trim().length;
-    if (n > len) { len = n; best = id; }
+    // 回显的用户原话带了实时在线前缀，比正文长，不能拿它当回答
+    const shown = spokenText(partText(r)).trim();
+    if (!shown || flat(shown) === t.userText) continue;
+    if (shown.length > len) { len = shown.length; best = id; }
   }
   return best;
 }
@@ -283,7 +291,7 @@ function answerId(t) {
 function answerText(t) {
   if (t.override != null) return t.override;
   const id = answerId(t);
-  return id ? partText(t.parts.get(id)) : '';
+  return id ? spokenText(partText(t.parts.get(id))) : '';
 }
 
 function schedulePaint(t) {
@@ -836,12 +844,14 @@ async function openSession(sid, title) {
   setStatus('', '已载入');
 
   const busy = await renderHistory(sid);
-  if (!busy) { loadSessions(); return; }
+  if (busy == null) return;
+  if (!busy) { setStatus('', '已载入'); loadSessions(); return; }
 
   setStatus('on', '运行中');
   T.follow = setInterval(async () => {
     if (T.busy || T.sid !== sid) return;
-    if (await renderHistory(sid)) return;
+    const still = await renderHistory(sid);
+    if (still == null || still) return;
     stopFollow();
     setStatus('done', '已完成');
     loadSessions();
@@ -858,13 +868,27 @@ function stopFollow() {
 async function renderHistory(sid) {
   streamEl.innerHTML = '';
   wrap = null;
-  ensureWrap();
+  ensureWrap().append(el('div', 'hint', '载入中…'));
+  setStatus('on', '载入中');
 
   let items = [], cards = [];
   try {
     const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/events');
-    ({ data: items = [], cards = [] } = await r.json());
-  } catch { setStatus('err', '读取失败'); }
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || 'HTTP ' + r.status);
+    items = Array.isArray(body.data) ? body.data : [];
+    cards = Array.isArray(body.cards) ? body.cards : [];
+  } catch (e) {
+    streamEl.innerHTML = '';
+    wrap = null;
+    ensureWrap().append(el('div', 'hint', '读取失败：' + String(e.message || e)));
+    setStatus('err', '读取失败');
+    return null;
+  }
+
+  streamEl.innerHTML = '';
+  wrap = null;
+  ensureWrap();
 
   // 一个回合在历史里是连着的好几条 assistant 消息，必须并成一个气泡
   const turns = [];
@@ -874,7 +898,7 @@ async function renderHistory(sid) {
     const parts = it?.parts || [];
     if (role === 'user') {
       const txt = parts.filter((p) => p.type === 'text').map((p) => p.text).filter(Boolean).join('\n');
-      if (txt) addUser(txt);
+      if (txt) addUser(spokenText(txt));
       turn = null;
       continue;
     }
@@ -971,7 +995,7 @@ async function loadDevices(quiet) {
   }
 
   let dev = { data: [] }, sc = { data: [] };
-  try { dev = await (await fetch('/api/iot/devices')).json(); } catch {}
+  try { dev = await (await fetch('/api/iot/devices' + (quiet ? '' : '?fresh=1'))).json(); } catch {}
   try { sc = await (await fetch('/api/iot/scenes')).json(); } catch {}
 
   box.innerHTML = '';
