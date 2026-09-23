@@ -978,15 +978,16 @@ async function loadDevices(quiet) {
   const p = el('div', 'pane-inner');
   box.append(p);
 
-  const online = dev.data.filter((d) => d.onlineStatus).length;
-  $('#devCount').textContent = dev.data.length || '';
+  const rows = Array.isArray(dev.data) ? dev.data : [];
+  const online = rows.filter((d) => d.onlineStatus).length;
+  $('#devCount').textContent = rows.length || '';
 
   if (dev.error) {
     const c = el('div', 'card');
     c.append(el('h3', null, '网关调用失败'));
     c.append(el('div', 'kv', `GET /ext/v3/ai/device-list → ${dev.error}`));
+    if (rows.length) c.append(el('div', 'hint', '下面仍列出本地清单里的设备，没拿到实时状态的按离线显示。'));
     p.append(c);
-    return;
   }
 
   const head = el('div', 'card');
@@ -996,7 +997,8 @@ async function loadDevices(quiet) {
     row.append(el('span', 'k', k), el('span', 'v' + (mono ? ' mono' : ''), v));
     head.append(row);
   };
-  kv('在线', `${online} / ${dev.data.length} 台`);
+  kv('在线', `${online} / ${rows.length} 台`);
+  kv('离线', `${rows.length - online} 台`);
   kv('接口', `GET /ext/v3/ai/device-list（${dev.ms ?? 0} ms）`, true);
   kv('网关', CFG.iot?.baseUrl || '');
   p.append(head);
@@ -1006,7 +1008,8 @@ async function loadDevices(quiet) {
   tb.innerHTML = '<thead><tr><th>房间</th><th>设备名</th><th>deviceName</th><th>品类</th><th>状态</th></tr></thead>';
   const tbody = el('tbody');
   const catName = (code) => ({ '01': '马桶', '04': '浴缸', '06': '镜柜' }[code] || code);
-  for (const d of dev.data) {
+  if (!rows.length) c.append(el('div', 'hint', '没有设备。'));
+  for (const d of rows) {
     const tr = el('tr', d.onlineStatus ? '' : 'off');
     const td = (txt, cls) => { const n = el('td', cls || null); n.textContent = txt; return n; };
     const roomTd = el('td');

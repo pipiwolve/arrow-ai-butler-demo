@@ -370,7 +370,6 @@ table.grid{border-collapse:collapse; width:100%; font-size:12.5px}
 table.grid th,table.grid td{border-bottom:1px solid var(--hairline-2); padding:8px 10px; text-align:left; vertical-align:top}
 table.grid th{font-size:11px; color:var(--dim); font-weight:500; letter-spacing:.5px}
 table.grid td.mono{font-family:var(--mono); font-size:11.5px}
-table.grid tr.off td{color:var(--dim)}
 table.grid tr:hover td{background:var(--soft)}
 .dot{display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--dim); margin-right:5px; vertical-align:1px}
 .dot.on{background:var(--ok)}

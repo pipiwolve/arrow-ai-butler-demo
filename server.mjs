@@ -1051,13 +1051,26 @@ export async function handler(req, res) {
     // 留着就是每次开面板都往客户平台发一个必然 404 的请求
     if (p === '/api/iot/devices') {
       const list = await iot.deviceList(SCENARIO.iot.homeId);
-      const rows = (list.response?.data || []).map((d) => {
+      const live = Array.isArray(list.response?.data) ? list.response.data : [];
+      const seen = new Set();
+      const rows = [];
+      const push = (d, onlineStatus) => {
+        if (!d?.deviceName || seen.has(d.deviceName)) return;
+        seen.add(d.deviceName);
         const fix = DEVICES.devices.find((x) => x.deviceName === d.deviceName) || {};
-        return {
-          ...d,
-          room: fix.room || '', categoryName: CATEGORY_NAME[d.categoryCode] || d.categoryCode,
-        };
-      });
+        const code = d.categoryCode || fix.categoryCode;
+        rows.push({
+          deviceName: d.deviceName,
+          categoryCode: code || '',
+          deviceTagName: d.deviceTagName || fix.deviceTagName || '',
+          onlineStatus: onlineStatus ? 1 : 0,
+          room: fix.room || '',
+          categoryName: CATEGORY_NAME[code] || code || '',
+        });
+      };
+      for (const d of live) push(d, d.onlineStatus);
+      // 平台列表可能只带在线设备，全离线时甚至是空数组。清单里有、这次没返回的，按离线补上。
+      for (const d of DEVICES.devices) push(d, 0);
       return sendJson(res, 200, { data: rows, ok: list.ok, error: list.error || null, ms: list.ms });
     }
     // 场景列表没有对应的平台接口（文档里只有 POST /scene，没有查询），所以这一屏
