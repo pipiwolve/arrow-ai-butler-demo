@@ -423,6 +423,21 @@ table.grid tr.sub .hint{padding:4px 0 0}
 .artifact-h .act{margin-left:auto; flex:none}
 .artifact-m{font-family:var(--mono); font-size:10.5px; color:var(--dim); margin-top:6px; word-break:break-all}
 
+/* 访问口令页。整页替换，所以自己撑满视口居中 */
+.authgate{min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; background:var(--canvas)}
+.authcard{
+  width:100%; max-width:360px; background:var(--card); border:1px solid var(--hairline);
+  border-radius:var(--r); padding:24px 22px; display:flex; flex-direction:column; gap:10px;
+}
+.authcard h2{margin:0 0 2px; font-size:15px; color:var(--ink)}
+.authcard .hint{padding:0; margin:0 0 6px}
+.authcard input{
+  font:inherit; font-size:13px; color:var(--ink); background:var(--canvas);
+  border:1px solid var(--hairline); border-radius:8px; padding:9px 11px;
+}
+.authcard input:focus{outline:none; border-color:var(--accent)}
+.authcard .mini{width:100%; justify-content:center; padding:8px 0}
+
 @media (max-width:820px){
   .app{grid-template-columns:1fr}
   .side{display:none}

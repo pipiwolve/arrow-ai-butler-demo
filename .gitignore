@@ -14,3 +14,6 @@ cards.jsonl
 箭牌智家AI 智能助手 需求说明书(1)-0.pdf
 iot接口文档/
 iot/devices.real.json
+
+# 本地代码索引，2MB 的二进制库，跟源码无关
+.codegraph/

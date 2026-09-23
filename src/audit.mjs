@@ -1,7 +1,8 @@
 // 审计留痕。需求 3.4：所有设备控制与场景操作都要记录操作人、时间、设备与动作。
-// 追加写 JSONL，一条一行，崩溃也不丢已写的记录。
-
-import fs from 'node:fs';
+// 追加写，一条一行，崩溃也不丢已写的记录。
+//
+// 存储后端由 src/store.mjs 决定：本地是 JSONL 文件，线上是 KV。
+// 这里只负责「抹敏感字段 + 拼一行 JSON」，不关心落到哪儿。
 
 // 网关请求头里有 bearer token，落盘前必须抹掉，审计日志是要给客户看的
 export function redact(v) {
@@ -17,18 +18,17 @@ export function redact(v) {
   return v;
 }
 
-export function createAudit(file) {
-  function append(rec) {
+export function createAudit(store) {
+  async function append(rec) {
     const line = JSON.stringify(redact({ at: new Date().toISOString(), ...rec }));
-    fs.appendFileSync(file, line + '\n');
+    await store.append(line);
     return rec;
   }
 
-  // 倒序读最近的 n 条。文件不大，直接全读再切
-  function tail(n = 100) {
-    if (!fs.existsSync(file)) return [];
-    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-    return lines.slice(-n).reverse().map((l) => {
+  // 倒序取最近的 n 条
+  async function tail(n = 100) {
+    const lines = await store.tail(n);
+    return lines.map((l) => {
       try { return JSON.parse(l); } catch { return { at: '', raw: l }; }
     });
   }

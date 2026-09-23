@@ -1,0 +1,13 @@
+{
+  "name": "arrow-ai-butler-demo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "箭牌智家 AI 助手 demo：DuMate Agent API + 安全闸门 + 箭牌 IoT 网关",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

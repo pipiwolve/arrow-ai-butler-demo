@@ -1732,11 +1732,59 @@ for (const ev of ['pointerup', 'pointercancel']) {
 // 否则首次的授权弹窗会让窗口失焦，把录音当场掐掉。
 window.addEventListener('blur', () => { if (MIC.on) stopRec(); });
 
+/* ================= 访问口令 ================= */
+
+// 部署到公网后这个地址就是一个 IoT 控制入口，所以线上带口令。
+// 口令没过时所有 /api 都回 401 + needAuth，这里把界面换成口令输入。
+function showAuthGate() {
+  const box = el('div', 'authgate');
+  const card = el('div', 'authcard');
+  card.append(el('h2', null, '需要访问口令'));
+  card.append(el('div', 'hint', '这个演示可以下发真实的设备控制指令，只对受邀的人开放。'));
+
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.placeholder = '访问口令';
+  input.autocomplete = 'current-password';
+
+  const btn = el('button', 'mini on', '进入');
+  const msg = el('div', 'hint err');
+
+  const submit = async () => {
+    btn.disabled = true;
+    msg.textContent = '';
+    try {
+      const r = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: input.value }),
+      });
+      if (r.ok) { location.reload(); return; }
+      const j = await r.json().catch(() => ({}));
+      msg.textContent = j.error || `HTTP ${r.status}`;
+    } catch (e) {
+      msg.textContent = String(e.message || e);
+    }
+    btn.disabled = false;
+    input.select();
+  };
+
+  btn.addEventListener('click', submit);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+  card.append(input, btn, msg);
+  box.append(card);
+  document.body.innerHTML = '';
+  document.body.append(box);
+  input.focus();
+}
+
 /* ================= 启动 ================= */
 
 (async () => {
   try {
-    CFG = await (await fetch('/api/config')).json();
+    const res = await fetch('/api/config');
+    if (res.status === 401) return showAuthGate();
+    CFG = await res.json();
     document.title = `${CFG.brand.product} · ${CFG.brand.vendor}`;
     $('#brandProduct').textContent = CFG.brand.product;
     $('#brandVendor').textContent = CFG.brand.vendor;

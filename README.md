@@ -157,6 +157,84 @@ mock 网关的运行态在内存里，**重启服务会清空**。审计流水�
 Key 从百度智能云控制台「语音技术」拿（IAM 新式 API Key，形如 `bce-v3/ALTAK-.../...`），
 样例见 `.env.example`。这条链路不经 DuMate，见「语音输入怎么接的」。
 
+本地默认没有口令门。想试线上那套，加一个环境变量即可：
+`ACCESS_PASSWORD=你的口令 node server.mjs`，之后 `/api/*` 都要先过口令，页面会弹输入框。
+部署到 Vercel 见下一节。
+
+## 部署到 Vercel
+
+同一份代码既能跑本地也能上 Vercel，差别只有三处，都由环境变量决定，不用改代码：
+存储后端、是否起本地网关、是否要口令。
+
+### 步骤
+
+1. 推到 GitHub，在 Vercel 里 Import 这个仓库。框架预设选 **Other**，不用改构建命令，
+   `vercel.json` 已经写好 `outputDirectory: public` 与函数的 `maxDuration`。
+2. 在 Project → Settings → Environment Variables 里配：
+
+   | 变量 | 必填 | 说明 |
+   | --- | --- | --- |
+   | `DUMATE_API_KEY` | 是 | DuMate 平台 Key |
+   | `DUMATE_BASE_URL` | 是 | `https://api.dumate.cn/api/v1` |
+   | `IOT_MODE` | 是 | 见下方「两种真实组合」 |
+   | `IOT_BASE_URL` | `real` 时必填 | `https://api-uatiot.arrowgroup.com.cn` |
+   | `IOT_TOKEN` | `real` 时必填 | 箭牌给的 bearer token |
+   | `IOT_FIXTURE` | 是 | `demo` 或 `real`，见下方 |
+   | `ACCESS_PASSWORD` | **客户演示务必填** | 见下方「口令门」 |
+   | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | 建议填 | 见下方「存储」 |
+   | `ASR_API_KEY` | 可选 | 不填则麦克风置灰 |
+
+3. Storage → 建一个 KV（Upstash Redis），Connect 到本项目，它会自动注入
+   `KV_REST_API_URL` 与 `KV_REST_API_TOKEN`，不用手抄。
+4. 首次访问会自动 bootstrap：上传知识库、建设备清单、建 Agent。冷启动找不到
+   `state.json` 时**先按名字查一遍已有 Agent**，查到就复用，不会在客户账号里攒出一堆同名的。
+
+### 两种真实组合，先想清楚要哪种
+
+| 组合 | 闸门用的在线态 | 演示效果 |
+| --- | --- | --- |
+| `IOT_MODE=real` + `IOT_FIXTURE=demo` | 演示在线态（主卫 5 台在线） | 能走完「下发 → 平台受理」，平台回 `code 500 设备离线` |
+| `IOT_MODE=real` + `IOT_FIXTURE=real` | 真实在线态（11 台全离线） | 闸门在发送前就拦下，看不到平台往返 |
+
+真实环境 11 台设备全离线，所以想让客户看到请求真的发出去了，得用第一行。
+第二行更「诚实」但演示效果差：所有控制都会被闸门拦成「设备离线」。
+`IOT_FIXTURE=real` 需要仓库里有 `iot/devices.real.json`，而那个文件**含真实序列号、已 gitignore**，
+Vercel 上从 git 构建是拿不到的。所以线上要用第二行的话，得把清单内容塞进环境变量或另想办法，
+别指望它跟着仓库上去。默认建议用第一行。
+
+### 存储：不配 KV 会「看着正常、其实在丢」
+
+Vercel 的函数实例即用即弃，写本地文件下一次请求就看不见了。审计留痕是需求点名的东西，
+不能随实例消失，所以线上要落外部 KV。没配 KV 也能启动，但会打一行警告，
+且**审计页与场景列表会时有时无**——不是坏了，是每次冷启动都换了块空盘。
+本地跑不受影响，仍是写文件，行为与改动前完全一致。
+
+### 口令门
+
+设了 `ACCESS_PASSWORD` 之后，所有 `/api/*` 都要先过口令，页面会弹一个输入框；
+口令对上了种一个 HMAC-SHA256 的 HttpOnly cookie（12 小时），HTTPS 下带 `Secure`。
+静态页不挡，否则输口令的界面自己就加载不出来。
+**不设就是裸的**：任何人都能用这个 demo 去下控箭牌的真实设备，客户演示环境务必设上。
+
+`ACCESS_PASSWORD` 与 KV 那几个变量以命令行/平台环境变量为准，不会被本地 `.env` 盖掉。
+这条是踩出来的：早先 `loadEnv` 只覆盖 `.env` 里声明过的键，
+`ACCESS_PASSWORD=xxx node server.mjs` 被静默忽略，现象是「明明设了口令，线上还是裸的」。
+
+### 套餐与超时
+
+`vercel.json` 给函数写了 `maxDuration: 300`，**Hobby 套餐不接受 300**，会直接构建失败。
+Hobby 上限 60 秒，Pro 配合 Fluid compute 才能到 300。用 Hobby 就把这个数字改成 60。
+一轮对话（Agent 流式回答 + 可能的工具调用）通常几秒到几十秒，60 秒够演示；
+真机联调偶尔会顶到边，那时再升 Pro。
+
+### 跨境这件事，得跟客户说在前面
+
+两个上游都在中国大陆：DuMate 与箭牌 IoT 网关解析出来都是境内 IP，而 Vercel 没有中国大陆区域。
+实测链路是「客户浏览器 → Vercel（境外）→ 境内上游」，延迟比本地跑高一个量级，
+且 `*.vercel.app` 域名在大陆部分网络下访问不稳定。
+给客户演示前先在客户现场的网络里试一遍。要是卡得不能看，备选是换个境内托管，
+或者把 demo 录成视频——代码不用动，换部署环境即可。
+
 ## 两套设备清单，别混用
 
 设备清单决定闸门认哪些设备，也决定 Agent 手里那份《设备与指令清单》。有两份，用途不同：
@@ -342,24 +420,28 @@ MCP 这一层没用上。真实对接的下一步与联想懂的 demo 一样：
 | `scenario.mjs` | 配置加载与校验（system 超长、等级非法、指令表为空都会直接报错），按 `IOT_FIXTURE` 选清单 |
 | `src/policy.mjs` | **安全闸门**：四道检查 + 待确认状态机 |
 | `src/agent-brief.mjs` | 从配置生成给 Agent 看的《设备与指令清单》，与闸门同一份事实来源 |
-| `src/audit.mjs` | 审计留痕，JSONL 追加写 |
-| `src/journal.mjs` | 卡片回放流水，JSONL 追加写。闸门卡/执行卡/报修卡按轮次落盘，历史回放靠它 |
+| `src/audit.mjs` | 审计留痕。写进 store，本地是 JSONL 追加 |
+| `src/journal.mjs` | 卡片回放流水。写进 store，本地是 JSONL 追加。闸门卡/执行卡/报修卡按轮次落盘，历史回放靠它 |
+| `src/store.mjs` | 可插拔存储：配了 KV 走 Redis REST，没配走本地文件。两个后端的 `tail()` 都是最新在上 |
 | `src/iot-client.mjs` | 按接口文档契约的 HTTP 客户端 |
 | `src/asr-client.mjs` | 百度短语音识别极速版客户端，裸 PCM 进、文本出。没配 Key 时明确报错，不影响其余功能 |
-| `src/env.mjs` | `.env` 读取，命令行环境变量可覆盖 |
+| `src/env.mjs` | `.env` 读取，命令行环境变量可覆盖。口令与 KV 变量强制以 process.env 为准 |
 | `iot/mock-gateway.mjs` | 箭牌 IoT 网关 mock，只实现文档里的三个 endpoint，不多挂旁路 |
 | `iot/fetch-devices.mjs` | 从真实环境抓一份设备清单，写进 `iot/devices.real.json` |
 | `iot/devices.json` | 演示设备清单（含 `room` 与在线态覆盖） |
 | `iot/devices.real.json` | 真实环境快照，脚本生成，勿手改。**含箭牌测试环境的真实设备序列号**，提交前留意 |
-| `server.mjs` | 本地编排 + DuMate 代理 + SSE，密钥只留服务端。技能管理 / 产物中心也在这层代理，浏览器不直接碰平台 Key |
-| `public/app.js` | 执行过程建模、SSE 解析、闸门与执行卡渲染、历史回放、技能管理、产物中心 |
+| `server.mjs` | 本地编排 + DuMate 代理 + SSE，密钥只留服务端。技能管理 / 产物中心也在这层代理，浏览器不直接碰平台 Key。导出 `handler` 供 Vercel 用，本地则自己 `listen` |
+| `api/[...path].mjs` | Vercel 函数入口，把请求转给 `server.mjs` 的 `handler` |
+| `vercel.json` | Vercel 配置：静态目录、函数超时与内存、要带上函数的配置文件 |
+| `package.json` | 声明 `type: module` 与 Node 版本要求，无第三方依赖 |
+| `public/app.js` | 执行过程建模、SSE 解析、闸门与执行卡渲染、历史回放、技能管理、产物中心、口令门 |
 | `data/箭牌产品知识库.md` | 产品百科素材（**占位数据，待箭牌提供正式资料**） |
 | `state.json` | bootstrap 结果缓存，已 gitignore |
 | `audit.jsonl` | 审计流水，已 gitignore |
 | `cards.jsonl` | 卡片回放流水，已 gitignore。删掉不影响对话，只是旧会话的卡片不再回放 |
 | `.brief/` | 每次 bootstrap 重新生成的 Agent 挂载文件，已 gitignore |
 | `.env` | API Key 与网关配置，**已 gitignore，不要提交** |
-| `.env.example` | 配置样例：两种 `IOT_MODE`、两份清单的切法、覆盖顺序、语音 Key，照它建 `.env` |
+| `.env.example` | 配置样例：两种 `IOT_MODE`、两份清单的切法、覆盖顺序、语音 Key、口令与 KV，照它建 `.env` |
 
 ## 数据来源与待确认项
 
@@ -555,6 +637,15 @@ MCP 这一层没用上。真实对接的下一步与联想懂的 demo 一样：
     一个必然 404，一个没有数据源。**mock 只该 mock 真实存在的东西**，
     要展示平台给不了的信息，就在界面上写明来源，别新开一个假 endpoint 撑着。
     现在的处理：两个都撤了，场景列表改读审计流水，设备页去掉那两列。
+
+35. **两个存储后端对 `tail()` 的顺序不一致。** 为了上 Vercel，审计与卡片流水抽了一层
+    `src/store.mjs`：本地写文件、线上写 KV。文件后端的 `tail(n)` 是
+    `lines().slice(-n).reverse()`，最新在上；Redis 后端的 `LRANGE key -n -1` 出来是正序，
+    最旧在上。`/api/audit` 把 `tail()` 的结果直接回给前端，所以这个差别不报错、不丢数据，
+    只是**上了 Vercel 审计页会整个倒过来**，而本地怎么试都是对的。
+    写这段时文件头注释还写着「两个后端的语义对齐在追加 + 倒序取尾部 + 全量取这三件事上」——
+    注释声明了不变量，代码没做到。补了 `.reverse()`，并加了一条跨后端一致性断言
+    （同一个键往两边各写一遍，比 `all()` 与 `tail()` 的输出），免得以后再分叉。
 
 ## 演示节奏
 

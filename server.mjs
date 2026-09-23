@@ -35,11 +35,13 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { SCENARIO, DEVICES, ROOT, FIXTURE_NAME } from './scenario.mjs';
 import { createGate } from './src/policy.mjs';
 import { createAudit, redact } from './src/audit.mjs';
 import { createJournal } from './src/journal.mjs';
+import { createStore, storageWarning } from './src/store.mjs';
 import { createIotClient } from './src/iot-client.mjs';
 import { createAsrClient } from './src/asr-client.mjs';
 import { loadEnv } from './src/env.mjs';
@@ -48,7 +50,9 @@ import { createGateway } from './iot/mock-gateway.mjs';
 
 const STATE_FILE = path.join(ROOT, 'state.json');
 const PUBLIC_DIR = path.join(ROOT, 'public');
-const BRIEF_DIR = path.join(ROOT, '.brief');
+// Vercel 上只有 /tmp 可写，仓库目录是只读的。清单是每次现生成、用完就传走，
+// 不需要留在仓库里，所以线上落到 tmpdir 就行。
+const BRIEF_DIR = process.env.VERCEL ? path.join(tmpdir(), 'arrow-brief') : path.join(ROOT, '.brief');
 
 // ---------- env ----------
 const ENV = loadEnv(ROOT);
@@ -64,17 +68,18 @@ if (!KEY) throw new Error('.env 里没有 DUMATE_API_KEY');
 const ASR_KEY = ENV.ASR_API_KEY || '';
 const ASR_DEV_PID = Number(ENV.ASR_DEV_PID || 80001);
 
-// ---------- 本地状态 ----------
-const readJson = (f, dflt) => {
-  try { return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : dflt; } catch { return dflt; }
-};
-const writeJson = (f, v) => fs.writeFileSync(f, JSON.stringify(v, null, 2));
-const readState = () => readJson(STATE_FILE, {});
-const writeState = (s) => writeJson(STATE_FILE, s);
+// ---------- 存储 ----------
+// 本地写文件，Vercel 上写 KV，由 src/store.mjs 按环境变量选。两者都是异步接口。
+const STATE_STORE = createStore({ name: 'arrow:state', file: STATE_FILE, env: ENV });
+const AUDIT_STORE = createStore({ name: 'arrow:audit', file: path.join(ROOT, 'audit.jsonl'), env: ENV });
+const CARD_STORE = createStore({ name: 'arrow:cards', file: path.join(ROOT, 'cards.jsonl'), env: ENV });
 
-const audit = createAudit(path.join(ROOT, 'audit.jsonl'));
-// 闸门卡、执行卡、报修卡的回放流水。平台消息里没有这三段，只能自己落盘
-const journal = createJournal(path.join(ROOT, 'cards.jsonl'));
+const readState = () => STATE_STORE.readJson({});
+const writeState = (s) => STATE_STORE.writeJson(s);
+
+const audit = createAudit(AUDIT_STORE);
+// 闸门卡、执行卡、报修卡的回放流水。平台消息里没有这三段，只能自己落
+const journal = createJournal(CARD_STORE);
 const gate = createGate({ scenario: SCENARIO, devices: DEVICES.devices });
 
 // ---------- IoT 网关 ----------
@@ -192,12 +197,60 @@ async function updateAgent(st, patch) {
     ...(patch.system ? { promptKey: promptKey(patch.system) } : {}),
     updatedAt: new Date().toISOString(),
   };
-  writeState(next);
+  await writeState(next);
+  return next;
+}
+
+// 冷启动时 state.json 可能不在（Vercel 上没配 KV 的话，每个新实例都是空的）。
+// 那种情况下不能直接建新 Agent —— 每冷启动一次就在客户账号里多一个同名 Agent，
+// 演示一上午能攒出十几个。先按名字去列表里找，各项对得上就复用。
+//
+// 能核对的：system 全文、skills 的 {skillID, releaseID}、挂载文件个数。
+// 核对不了的：文件内容 —— GET 只回 fileID，不回文件名，没法确认挂的是不是当前那份清单。
+// 所以这只是一层兜底，正路是配 KV 让 state.json 真正持久化。
+async function findReusableAgent({ skills, pKey, want, fixtureKey }) {
+  let list;
+  try {
+    list = await api('/agents?page=1&pageSize=50');
+  } catch (e) {
+    console.warn(`[agent] 查 Agent 列表失败，改为新建：${e.message}`);
+    return null;
+  }
+  const same = (list?.data || []).filter((a) => a.name === SCENARIO.agent.name);
+  if (!same.length) return null;
+
+  const fileCount = agentUploads().length;
+  const hit = same.find((a) => a.system === SCENARIO.agent.system
+    && skillKey(a.skills) === skillKey(skills)
+    && (a.files || []).length === fileCount);
+  if (!hit) {
+    console.warn(`[agent] 有 ${same.length} 个同名 Agent，但没有一个与当前配置对得上，新建一个。`
+      + `（同名 Agent 会越攒越多，确认无用后可去平台删掉）`);
+    return null;
+  }
+
+  // 用平台返回的实况回填 state，而不是照抄我们以为的配置
+  const next = {
+    scenarioId: SCENARIO.id,
+    fixtureKey,
+    briefKey: createHash('sha1').update(fs.readFileSync(agentUploads().at(-1))).digest('hex').slice(0, 12),
+    agentId: hit.id,
+    agentVersion: hit.version,
+    files: (hit.files || []).map((f) => ({ name: '', fileID: f.fileID })),
+    skills,
+    skillsKey: skillKey(skills),
+    promptKey: pKey,
+    reusedByLookup: true,
+    createdAt: hit.createdAt || new Date().toISOString(),
+  };
+  await writeState(next);
+  console.log(`[agent] 冷启动：按名字复用已有 Agent ${hit.id}（v${hit.version}）。`
+    + `挂载文件内容未能核对（接口只回 fileID），若刚改过资料请访问 /api/bootstrap?force=1 重建。`);
   return next;
 }
 
 async function bootstrap({ force = false } = {}) {
-  const st = readState();
+  const st = await readState();
   const uploads = agentUploads();
   const want = uploads.map((u) => path.basename(u)).join(',');
   // 只比数量不够：换掉一个挂载文件时数量不变，会错误复用旧 Agent
@@ -214,6 +267,14 @@ async function bootstrap({ force = false } = {}) {
   const pKey = promptKey(SCENARIO.agent.system);
   const reusable = !force && st.agentId && st.scenarioId === SCENARIO.id && want === have
     && st.fixtureKey === fixtureKey && st.briefKey === briefKey;
+  // 走到「要建新 Agent」这一步之前，先按名字找一遍。两种情况会到这里：
+  //   state.json 整个不在（Vercel 冷启动），或者 state 里没有文件名可比
+  //   （上一次就是靠查名字复用来的，那种 state 的 files 只有 fileID）。
+  // 不查就直接建，会在客户账号里攒出一堆同名 Agent。
+  if (!reusable && !force) {
+    const found = await findReusableAgent({ skills, pKey, want, fixtureKey });
+    if (found) return found;
+  }
   if (reusable && st.skillsKey === skillKey(skills) && st.promptKey === pKey) return st;
   if (reusable) {
     // Agent 本身没变，变的是挂载的技能或提示词（改了 scenario.json，或技能页手动加减过）
@@ -252,7 +313,7 @@ async function bootstrap({ force = false } = {}) {
     promptKey: pKey,
     createdAt: new Date().toISOString(),
   };
-  writeState(next);
+  await writeState(next);
   if (skills.length) console.log(`[agent] 新建 v${next.agentVersion}，技能：${skills.map((s) => s.name).join('/')}`);
   return next;
 }
@@ -502,13 +563,13 @@ async function execute(rec, { trigger, actor = 'app-user', sessionId }) {
     // 不然 targets 是一锅烩，回看时分不出哪条是触发条件
     ...(isScene ? { scene: { conditionList: rec.action.conditionList || [], actionList: rec.action.actionList || [] } } : {}),
   };
-  audit.append(entry);
+  await audit.append(entry);
   return { ...entry, ok: res.ok };
 }
 
 // ---------- 会话 ----------
 async function listSessions() {
-  const st = readState();
+  const st = await readState();
   const all = [];
   let cursor = '';
   for (let i = 0; i < 6; i++) {
@@ -640,7 +701,7 @@ async function handleAsk(req, res) {
     // 报修只给 deeplink，没有副作用，不用过闸门
     if (action.action === 'repair.open') {
       const kind = action.kind === 'progress' ? 'progress' : 'report';
-      audit.append({
+      await audit.append({
         kind: 'repair.open', actor: 'app-user', sessionId: sid, level: 'L',
         decision: 'EXECUTED', trigger: 'gate-auto', reasons: ['报修引导：只给入口，不对接工单'],
         targets: [], result: 'SUCCEEDED', deeplink: SCENARIO.repair.deeplink[kind],
@@ -657,7 +718,7 @@ async function handleAsk(req, res) {
     });
 
     if (verdict.decision === 'deny') {
-      audit.append({
+      await audit.append({
         kind: action.action, actor: 'app-user', sessionId: sid, level: verdict.level,
         decision: 'DENIED', trigger: 'gate', reasons: verdict.reasons,
         targets: verdict.items || [], result: 'BLOCKED',
@@ -680,7 +741,7 @@ async function handleAsk(req, res) {
   } finally {
     // 落盘放在最后：确认卡那一轮 cards 只有闸门卡，执行卡是用户点确认后才产生的，
     // 由 /api/confirm 另记一条 resolve，回放时再拼起来。
-    journal.appendTurn({ sessionId: sid, msgId, cards });
+    await journal.appendTurn({ sessionId: sid, msgId, cards });
     // 补推下载地址。四条早退分支都会流到这里，写一处就够。
     // demo.done 已经发过了，这里多等几秒不会让界面卡在「思考中」；
     // 这条例外事件不进 cards，临时签名地址落盘没有意义，回放时前端自己再取一次。
@@ -744,8 +805,8 @@ async function handleConfirm(req, res) {
       decision: 'REJECTED', trigger: 'gate-confirm', reasons: rec.reasons,
       targets: rec.items, result: 'CANCELLED',
     };
-    audit.append(entry);
-    journal.appendResolve({ sessionId, pendingId, decision: 'reject' });
+    await audit.append(entry);
+    await journal.appendResolve({ sessionId, pendingId, decision: 'reject' });
     return sendJson(res, 200, entry);
   }
 
@@ -753,7 +814,7 @@ async function handleConfirm(req, res) {
     const out = await execute(rec, { trigger: 'gate-confirm', sessionId });
     gate.settle(pendingId, out.ok ? 'SUCCEEDED' : 'FAILED');
     // 回放时靠这条把待确认卡改成「已确认」，并补出确认后才有的那张执行卡
-    journal.appendResolve({ sessionId, pendingId, decision: 'approve', out });
+    await journal.appendResolve({ sessionId, pendingId, decision: 'approve', out });
     // out 里有 iotRequest.headers.Authorization。journal 和 audit 落盘前都会抹掉，
     // 这条响应是直接回给浏览器的，漏了就会让客户在自己的 Network 面板里看见自家 token。
     return sendJson(res, 200, redact(out));
@@ -878,11 +939,63 @@ function serveStatic(res, urlPath) {
   fs.createReadStream(abs).pipe(res);
 }
 
+// ---------- 访问口令 ----------
+// 部署到公网后这个地址就是一个 IoT 控制入口：拿到 URL 的人能操控客户家里 homeId 933 的设备。
+// 所以线上必须带口令。没配 ACCESS_PASSWORD 时不启用，本地开发照旧。
+//
+// 口令本身不进 Cookie，Cookie 里放的是它的 HMAC。知道 Cookie 值反推不出口令。
+const ACCESS_PASSWORD = ENV.ACCESS_PASSWORD || '';
+const AUTH_COOKIE = 'arrow_auth';
+const authToken = () => createHmac('sha256', ACCESS_PASSWORD).update('arrow-demo-v1').digest('hex');
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+
+function isAuthed(req) {
+  if (!ACCESS_PASSWORD) return true;
+  const got = parseCookies(req)[AUTH_COOKIE] || '';
+  const want = authToken();
+  // 长度不等时 timingSafeEqual 会抛，先挡掉
+  return got.length === want.length && timingSafeEqual(Buffer.from(got), Buffer.from(want));
+}
+
+async function handleLogin(req, res) {
+  const body = await readBody(req);
+  const given = String(body?.password ?? '');
+  const want = ACCESS_PASSWORD;
+  const ok = given.length === want.length && timingSafeEqual(Buffer.from(given), Buffer.from(want));
+  if (!ok) {
+    // 失败时拖一下，挡住脚本化的快速猜测。serverless 上没有进程内计数可用，够用了
+    await new Promise((r) => setTimeout(r, 700));
+    console.warn('[auth] 口令错误');
+    return sendJson(res, 401, { error: '口令不对' });
+  }
+  res.setHeader('Set-Cookie',
+    `${AUTH_COOKIE}=${authToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 12}`
+    + (req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : ''));
+  return sendJson(res, 200, { ok: true });
+}
+
 // ---------- 路由 ----------
-const server = http.createServer(async (req, res) => {
+export async function handler(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const p = url.pathname;
   try {
+    if (p === '/api/login' && req.method === 'POST') return await handleLogin(req, res);
+    if (p === '/api/logout' && req.method === 'POST') {
+      res.setHeader('Set-Cookie', `${AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+      return sendJson(res, 200, { ok: true });
+    }
+    // 口令门挡在所有 /api 前面。静态页不挡 —— 挡了就看不到输口令的界面了
+    if (p.startsWith('/api/') && !isAuthed(req)) {
+      return sendJson(res, 401, { error: '需要访问口令', needAuth: true });
+    }
     if (p === '/api/config') {
       return sendJson(res, 200, {
         brand: SCENARIO.brand,
@@ -903,6 +1016,7 @@ const server = http.createServer(async (req, res) => {
         },
         // 没配 ASR Key 时前端直接把麦克风置灰，不要让人按下去才看到报错
         voice: { enabled: !!ASR_KEY },
+        auth: { enabled: !!ACCESS_PASSWORD },
       });
     }
     if (p === '/api/bootstrap') {
@@ -924,7 +1038,7 @@ const server = http.createServer(async (req, res) => {
     if (mHist) {
       const items = await api(`/sessions/${mHist[1]}/events`);
       // 卡片与平台消息一起给前端，省一次往返，也避免两边不同步
-      return sendJson(res, 200, { data: items, cards: journal.bySession(mHist[1]) });
+      return sendJson(res, 200, { data: items, cards: await journal.bySession(mHist[1]) });
     }
 
     // 设备面板：全部字段走真实接口，room 与品类名是本地补的显示字段
@@ -945,7 +1059,7 @@ const server = http.createServer(async (req, res) => {
     // 列的是本编排层自己建过的场景，从审计流水里取。真实平台建完场景后返回什么结构
     // 我们没有样本，所以这里只回我们确定发出去的那几个字段，不假装知道平台的回执。
     if (p === '/api/iot/scenes') {
-      const rows = audit.tail(500)
+      const rows = (await audit.tail(500))
         .filter((e) => e.kind === 'scene.create' && e.result === 'SUCCEEDED')
         .map((e) => {
           // 新记录带 scene 分列。早于这次改动的记录只有 targets（条件与动作混在一起），
@@ -965,7 +1079,7 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/audit') {
       const limit = Number(url.searchParams.get('limit') || 100);
-      return sendJson(res, 200, { data: audit.tail(limit) });
+      return sendJson(res, 200, { data: await audit.tail(limit) });
     }
 
     // ---- 技能管理 ----
@@ -997,12 +1111,12 @@ const server = http.createServer(async (req, res) => {
 
     // ---- Agent 挂载 ----
     if (p === '/api/agent') {
-      const st = readState();
+      const st = await readState();
       if (!st.agentId) return sendJson(res, 400, { error: '还没 bootstrap，先 GET /api/bootstrap' });
       return sendJson(res, 200, await agentMounted(st));
     }
     if (p === '/api/agent/skills' && req.method === 'POST') {
-      const st = readState();
+      const st = await readState();
       if (!st.agentId) return sendJson(res, 400, { error: '还没 bootstrap' });
       return sendJson(res, 200, await mountSkill(st, await readBody(req)));
     }
@@ -1033,32 +1147,44 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) sendJson(res, 500, { error: String(e.message || e) });
     else res.end();
   }
-});
+}
 
 // ---------- 起服务 ----------
-if (IOT_MODE === 'mock') {
-  gateway.listen(IOT_PORT, '127.0.0.1', () => {
-    console.log(`  IoT 网关（mock）  http://127.0.0.1:${IOT_PORT}   homeId=${SCENARIO.iot.homeId}   设备清单=${FIXTURE_NAME}`);
+// Vercel 上没有常驻进程，入口是 api/[...path].mjs，它直接调上面的 handler。
+// 这一段只在本地跑，不然 import 这个文件就会去 listen 一个端口。
+const ON_VERCEL = !!process.env.VERCEL;
+
+const warn = storageWarning(ENV, ON_VERCEL);
+if (warn) console.warn(`\n  ⚠ ${warn}\n`);
+
+if (!ON_VERCEL) {
+  if (IOT_MODE === 'mock') {
+    gateway.listen(IOT_PORT, '127.0.0.1', () => {
+      console.log(`  IoT 网关（mock）  http://127.0.0.1:${IOT_PORT}   homeId=${SCENARIO.iot.homeId}   设备清单=${FIXTURE_NAME}`);
+    });
+    gateway.on('error', (e) => console.error('[iot] 网关启动失败', e.message));
+  } else {
+    console.log(`  IoT 网关（真实）  ${ENV.IOT_BASE_URL}   设备清单=${FIXTURE_NAME}`);
+  }
+  if (IOT_MODE === 'real' && FIXTURE_NAME === 'demo') {
+    console.log('  提示：真实网关 + 演示清单。演示清单把主卫 5 台标成在线，闸门会放行，请求真发到箭牌；');
+    console.log('        但真实环境这 11 台全离线，平台会回「设备离线」。设备页的在线态取自真实接口，和闸门判定不一致。');
+  }
+  if (IOT_MODE === 'real' && FIXTURE_NAME === 'real') {
+    console.log('  提示：真实网关 + 真实清单。11 台全离线，闸门会在下发前就拦掉，请求到不了箭牌。');
+  }
+
+  const server = http.createServer(handler);
+
+  server.listen(PORT, () => {
+    console.log(`\n  ${SCENARIO.brand.product} · ${SCENARIO.brand.vendor}`);
+    console.log(`  场景 ${SCENARIO.id}    配置 config/scenario.json`);
+    console.log(`  → http://localhost:${PORT}`);
+    console.log(`  存储 ${STATE_STORE.kind}    访问口令 ${ACCESS_PASSWORD ? '已启用' : '未启用（本地默认）'}`);
+    console.log(`  DuMate API: ${BASE}\n`);
   });
-  gateway.on('error', (e) => console.error('[iot] 网关启动失败', e.message));
-} else {
-  console.log(`  IoT 网关（真实）  ${ENV.IOT_BASE_URL}   设备清单=${FIXTURE_NAME}`);
-}
-if (IOT_MODE === 'real' && FIXTURE_NAME === 'demo') {
-  console.log('  提示：真实网关 + 演示清单。演示清单把主卫 5 台标成在线，闸门会放行，请求真发到箭牌；');
-  console.log('        但真实环境这 11 台全离线，平台会回「设备离线」。设备页的在线态取自真实接口，和闸门判定不一致。');
-}
-if (IOT_MODE === 'real' && FIXTURE_NAME === 'real') {
-  console.log('  提示：真实网关 + 真实清单。11 台全离线，闸门会在下发前就拦掉，请求到不了箭牌。');
-}
 
-server.listen(PORT, () => {
-  console.log(`\n  ${SCENARIO.brand.product} · ${SCENARIO.brand.vendor}`);
-  console.log(`  场景 ${SCENARIO.id}    配置 config/scenario.json`);
-  console.log(`  → http://localhost:${PORT}`);
-  console.log(`  DuMate API: ${BASE}\n`);
-});
-
-const shutdown = () => { try { gateway.close(); } catch {} ; server.close(); process.exit(0); };
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+  const shutdown = () => { try { gateway.close(); } catch {} ; server.close(); process.exit(0); };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "outputDirectory": "public",
+  "functions": {
+    "api/**/*.mjs": {
+      "maxDuration": 300,
+      "memory": 1024,
+      "includeFiles": "{config,data,iot}/**"
+    }
+  }
+}

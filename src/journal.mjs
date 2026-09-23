@@ -9,34 +9,33 @@
 //
 // 一条记录 = 一轮收尾时产出的全部卡片，挂在那一轮最后一条 assistant 消息 ID 上。
 // 回放时平台历史里能找到同一个 ID，据此精确贴回对应轮次，不靠时间戳猜（本地与服务端时钟不同源）。
+//
+// 存储后端由 src/store.mjs 决定，本地是 cards.jsonl，线上是 KV。
 
-import fs from 'node:fs';
 import { redact } from './audit.mjs';
 
-export function createJournal(file) {
+export function createJournal(store) {
   // 一轮的卡片。msgId 是那一轮最后一条 assistant 消息的 ID，也是回放时的锚点。
-  function appendTurn({ sessionId, msgId, cards }) {
+  async function appendTurn({ sessionId, msgId, cards }) {
     if (!sessionId || !msgId || !cards?.length) return;
-    write({ sessionId, msgId, type: 'cards', cards });
+    await write({ sessionId, msgId, type: 'cards', cards });
   }
 
   // 用户点了确认或取消。待确认卡在回放里据此变成终态，并补上确认后才产生的那张执行卡。
-  function appendResolve({ sessionId, pendingId, decision, out }) {
+  async function appendResolve({ sessionId, pendingId, decision, out }) {
     if (!sessionId || !pendingId) return;
-    write({ sessionId, pendingId, decision, out: out || null });
+    await write({ sessionId, pendingId, decision, out: out || null });
   }
 
-  function write(rec) {
+  async function write(rec) {
     // 执行卡里带着网关请求头，和审计一样必须先抹掉 bearer token
-    fs.appendFileSync(file, JSON.stringify(redact({ at: new Date().toISOString(), ...rec })) + '\n');
+    await store.append(JSON.stringify(redact({ at: new Date().toISOString(), ...rec })));
   }
 
-  // 文件不大，全读再筛。顺序即写入顺序，回放要靠它还原卡片先后
-  function bySession(sessionId) {
-    if (!fs.existsSync(file)) return [];
+  // 全量取再按会话筛。顺序即写入顺序，回放要靠它还原卡片先后
+  async function bySession(sessionId) {
     const out = [];
-    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
-      if (!line) continue;
+    for (const line of await store.all()) {
       let rec;
       try { rec = JSON.parse(line); } catch { continue; }
       if (rec.sessionId === sessionId) out.push(rec);
