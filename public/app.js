@@ -501,13 +501,101 @@ function addExecCard(t, out) {
   scrollBottom();
 }
 
+function repairLinks(d) {
+  const links = d?.deeplinks || {};
+  const report = links.report || (d?.kind === 'progress' ? '' : d?.deeplink) || '';
+  const progress = links.progress || (d?.kind === 'progress' ? d?.deeplink : '') || '';
+  return { report, progress };
+}
+
+function repairDevice(summary) {
+  const s = String(summary || '');
+  if (/镜柜/.test(s)) return '镜柜';
+  if (/浴缸/.test(s)) return '浴缸';
+  if (/坐便|马桶/.test(s)) return '坐便器';
+  return '待确认';
+}
+
+function repairPhone(d, kind) {
+  const phone = el('div', 'repair-phone');
+  const top = el('div', 'rp-top');
+  top.append(el('span', null, '箭牌智家'), el('em', null, '报修'));
+  phone.append(top);
+  const body = el('div', 'rp-body');
+  if (kind === 'progress') {
+    body.append(el('div', 'rp-title', '报修进度'));
+    body.append(el('div', 'rp-empty', '这里只预览进度页。单据、派单和上门都在 App 里，本助手不查询真实工单。'));
+  } else {
+    body.append(el('div', 'rp-title', '提交报修'));
+    const dev = el('div', 'rp-field');
+    dev.append(el('span', null, '设备'), el('b', null, repairDevice(d.summary)));
+    const issue = el('div', 'rp-field');
+    issue.append(el('span', null, '问题'), el('b', null, d.summary || '按刚才的描述提交'));
+    body.append(dev, issue);
+    body.append(el('div', 'rp-btn', '提交报修'));
+    body.append(el('div', 'rp-sub', '预览，不会真的提交'));
+  }
+  phone.append(body);
+  return phone;
+}
+
+function openRepairPreview(d) {
+  document.querySelector('.repair-mask')?.remove();
+  const links = repairLinks(d);
+  let kind = d.kind === 'progress' ? 'progress' : 'report';
+  const mask = el('div', 'repair-mask');
+  const sheet = el('div', 'repair-sheet');
+  const head = el('div', 'repair-sheet-h');
+  head.append(el('b', null, '跳转预览'));
+  const close = el('button', 'mini', '关闭');
+  close.type = 'button';
+  head.append(close);
+  const tabs = el('div', 'repair-tabs');
+  const tabReport = el('button', 'on', '提交报修');
+  const tabProgress = el('button', null, '报修进度');
+  tabReport.type = 'button';
+  tabProgress.type = 'button';
+  tabs.append(tabReport, tabProgress);
+  const stage = el('div', 'repair-stage');
+  const url = el('div', 'repair-url');
+  const paint = () => {
+    tabReport.classList.toggle('on', kind === 'report');
+    tabProgress.classList.toggle('on', kind === 'progress');
+    stage.innerHTML = '';
+    stage.append(repairPhone(d, kind));
+    url.textContent = (kind === 'progress' ? links.progress : links.report) || d.deeplink || '';
+  };
+  tabReport.onclick = () => { kind = 'report'; paint(); };
+  tabProgress.onclick = () => { kind = 'progress'; paint(); };
+  sheet.append(head, tabs, stage, url, el('p', null, d.note || '真实跳转地址待箭牌 App 确认，当前是预留入口。'));
+  mask.append(sheet);
+  const dismiss = () => { mask.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = (e) => { if (e.key === 'Escape') dismiss(); };
+  close.onclick = dismiss;
+  mask.addEventListener('click', (e) => { if (e.target === mask) dismiss(); });
+  document.addEventListener('keydown', onKey);
+  document.body.append(mask);
+  paint();
+  close.focus();
+}
+
 function addRepairCard(t, d) {
+  if (t.cardsEl.querySelector('.repair')) return;
+  const kind = d.kind === 'progress' ? 'progress' : 'report';
   const card = el('div', 'repair');
-  card.append(el('b', null, d.kind === 'progress' ? '打开报修进度' : '打开报修入口'));
-  card.append(el('p', null, d.note || ''));
-  const a = el('a', null, `唤起箭牌智家 APP（${d.deeplink}）`);
-  a.href = d.deeplink;
-  card.append(a);
+  const h = el('div', 'repair-h');
+  h.append(el('b', null, '跳转预览'));
+  h.append(el('span', 'pill', '预留地址'));
+  card.append(h);
+  card.append(el('p', null, '下面是即将打开的报修页。地址还没换成箭牌 App 的正式链接，点开只做预览。'));
+  card.append(repairPhone(d, kind));
+  const foot = el('div', 'repair-foot');
+  const btn = el('button', 'mini primary', '放大预览');
+  btn.type = 'button';
+  btn.onclick = () => openRepairPreview(d);
+  const url = el('span', 'repair-url', repairLinks(d)[kind] || d.deeplink || '');
+  foot.append(btn, url);
+  card.append(foot);
   t.cardsEl.append(card);
   scrollBottom();
 }
@@ -975,12 +1063,57 @@ function paintSessions() {
   if (!allSessions.length) { sessionsEl.append(el('div', 'hint', '还没有对话')); return; }
   if (!data.length) { sessionsEl.append(el('div', 'hint', '没有匹配的会话')); return; }
   for (const s of data) {
-    const b = el('button', 'sitem' + (s.id === T.sid ? ' on' : ''));
+    const row = el('div', 'srow' + (s.id === T.sid ? ' on' : ''));
+    const b = el('button', 'sitem');
     b.type = 'button';
     b.append(el('div', 't', s.title), el('div', 'd', fmtWhen(s.updatedAt || s.createdAt)));
     b.onclick = () => { switchView('chat'); openSession(s.id, s.title); };
-    sessionsEl.append(b);
+    row.append(b, sessionDeleteBtn(s));
+    sessionsEl.append(row);
   }
+}
+
+// 平台没有「归档」。删除是 DELETE /sessions/{id}，会话从列表里消失。
+// 按两下才发出去，避免侧栏里误点。
+function sessionDeleteBtn(s) {
+  const b = el('button', 'sdel', '删除');
+  b.type = 'button';
+  let armed = 0;
+  b.onclick = async (ev) => {
+    ev.stopPropagation();
+    if (!armed) {
+      armed = setTimeout(() => { armed = 0; b.textContent = '删除'; }, 4000);
+      b.textContent = '确认';
+      return;
+    }
+    clearTimeout(armed);
+    armed = 0;
+    b.disabled = true;
+    b.textContent = '…';
+    try {
+      const r = await fetch('/api/sessions/' + encodeURIComponent(s.id), { method: 'DELETE' });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+      if (T.sid === s.id) resetChat();
+      await loadSessions();
+    } catch (e) {
+      b.disabled = false;
+      b.textContent = '失败';
+      b.title = String(e.message || e);
+    }
+  };
+  return b;
+}
+
+function resetChat() {
+  if (T.ctl) { T.ctl.abort(); T.ctl = null; }
+  stopFollow();
+  T.sid = null; T.busy = false; T.turn = null;
+  sendBtn.disabled = false;
+  chatTitle.textContent = '新对话';
+  setStatus('', '空闲');
+  switchView('chat');
+  showEmpty();
 }
 
 /* ================= 家庭设备 ================= */
@@ -1502,17 +1635,7 @@ $('#form').addEventListener('submit', (e) => {
   inputEl.style.height = 'auto';
   ask(t);
 });
-$('#btnNew').onclick = () => {
-  if (T.ctl) { T.ctl.abort(); T.ctl = null; }
-  stopFollow();
-  T.sid = null; T.busy = false; T.turn = null;
-  sendBtn.disabled = false;
-  chatTitle.textContent = '新对话';
-  setStatus('', '空闲');
-  switchView('chat');
-  showEmpty();
-  loadSessions();
-};
+$('#btnNew').onclick = () => { resetChat(); loadSessions(); };
 $('#btnReloadDev').onclick = () => loadDevices();
 $('#btnReloadAudit').onclick = loadAudit;
 $('#btnReloadSkills').onclick = loadSkills;

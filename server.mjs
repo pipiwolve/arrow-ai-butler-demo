@@ -768,7 +768,34 @@ async function handleAsk(req, res) {
     exported.push(...(r.artifacts || []).map((a) => ({ ...a, sessionId: sid })));
     for (const a of exported) card('demo.artifact', { ...a, downloadUrl: null });
 
+    // 模型忘了附 repair.open 时，正文已经在说报修，仍然补一张跳转预览。
+    // 不补的话用户只看到「可以跳到报修页」，页面上没有入口。
+    const repairKindFrom = (text) => {
+      const s = String(text || '');
+      if (!/报修/.test(s)) return null;
+      if (/进度/.test(s) && !/提交|报修单|跳/.test(s)) return 'progress';
+      return 'report';
+    };
+    const openRepair = async (kind, summary) => {
+      const which = kind === 'progress' ? 'progress' : 'report';
+      const deeplink = SCENARIO.repair.deeplink[which];
+      await audit.append({
+        kind: 'repair.open', actor: 'app-user', sessionId: sid, level: 'L',
+        decision: 'EXECUTED', trigger: 'gate-auto', reasons: ['报修引导：只给入口，不对接工单'],
+        targets: [], result: 'SUCCEEDED', deeplink,
+      });
+      card('demo.repair', {
+        kind: which,
+        deeplink,
+        deeplinks: SCENARIO.repair.deeplink,
+        note: SCENARIO.repair.note,
+        summary: String(summary || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+      });
+    };
+
     if (!action) {
+      const inferred = repairKindFrom(clean);
+      if (inferred) await openRepair(inferred, q);
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
     }
@@ -778,12 +805,7 @@ async function handleAsk(req, res) {
     // 报修只给 deeplink，没有副作用，不用过闸门
     if (action.action === 'repair.open') {
       const kind = action.kind === 'progress' ? 'progress' : 'report';
-      await audit.append({
-        kind: 'repair.open', actor: 'app-user', sessionId: sid, level: 'L',
-        decision: 'EXECUTED', trigger: 'gate-auto', reasons: ['报修引导：只给入口，不对接工单'],
-        targets: [], result: 'SUCCEEDED', deeplink: SCENARIO.repair.deeplink[kind],
-      });
-      card('demo.repair', { kind, deeplink: SCENARIO.repair.deeplink[kind], note: SCENARIO.repair.note });
+      await openRepair(kind, action.say || q);
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
     }
@@ -1141,6 +1163,13 @@ export async function handler(req, res) {
       return sendJson(res, 200, {
         data: list.map((s) => ({ id: s.id, title: s.metadata?.title || '(未命名)', status: s.status, createdAt: s.createdAt, updatedAt: s.updatedAt })),
       });
+    }
+    // 公开文档没写删除，但 DELETE /sessions/{id} 对不存在的 id 回的是 session not found，
+    // 不是 405。侧栏的删除按钮走这一条，平台上的会话会真正去掉。
+    const mDel = p.match(/^\/api\/sessions\/([^/]+)$/);
+    if (mDel && req.method === 'DELETE') {
+      await api(`/sessions/${mDel[1]}`, { method: 'DELETE' });
+      return sendJson(res, 200, { ok: true });
     }
     const mHist = p.match(/^\/api\/sessions\/([^/]+)\/events$/);
     if (mHist) {
