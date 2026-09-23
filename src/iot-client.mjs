@@ -1,6 +1,7 @@
-// 箭牌 IoT 网关客户端。按接口文档的三组接口封装，走真实 HTTP。
+// 箭牌 IoT 网关客户端。按接口文档的三个接口封装，走真实 HTTP。
 // 现在指向 iot/mock-gateway.mjs，把 .env 的 IOT_BASE_URL / IOT_TOKEN 换成箭牌测试环境
 // 的值即可指向 https://api-uatiot.arrowgroup.com.cn，代码不用动。
+// 只有文档里的这三个接口，没有旁路。
 
 export function createIotClient({ baseUrl, token, appPlatform, deviceSystemPlatform }) {
   async function call(method, p, { query, body } = {}) {
@@ -57,8 +58,5 @@ export function createIotClient({ baseUrl, token, appPlatform, deviceSystemPlatf
     deviceList: (homeId) => call('GET', '/ext/v3/ai/device-list', { query: { homeId } }),
     control: (homeId, cmdList) => call('POST', '/ext/v3/ai/control', { body: { homeId, cmdList } }),
     createScene: (homeId, conditionList, actionList) => call('POST', '/ext/v3/ai/scene', { body: { homeId, conditionList, actionList } }),
-    sceneList: () => call('GET', '/ext/v3/ai/scene-list'),
-    // 非对外契约，只给演示面板看运行态用
-    demoState: () => call('GET', '/ext/v3/ai/demo-state'),
   };
 }

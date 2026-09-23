@@ -15,13 +15,15 @@
       <span class="mark" aria-hidden="true">
         <svg viewBox="0 0 32 32" width="28" height="28"><path d="M4 22 L16 6 L28 22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 26 L16 18 L22 26" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity=".45"/></svg>
       </span>
-      <div class="bt"><b id="brandProduct">箭牌智家 AI 助手</b><span id="brandVendor">DuMate Agent</span></div>
+      <div class="bt"><b id="brandProduct">箭牌智家 AI 助手</b><span id="brandVendor">ARROW 箭牌卫浴</span></div>
     </div>
 
     <nav class="nav" id="nav">
       <button type="button" data-view="chat" class="on"><i>◈</i>对话</button>
       <button type="button" data-view="devices"><i>⌂</i>家庭设备<em id="devCount"></em></button>
       <button type="button" data-view="audit"><i>▤</i>安全审计<em id="auditCount"></em></button>
+      <button type="button" data-view="skills"><i>✦</i>技能管理<em id="skillCount"></em></button>
+      <button type="button" data-view="artifacts"><i>⇣</i>产物中心<em id="artCount"></em></button>
     </nav>
 
     <div class="sec" id="secSessions">
@@ -33,7 +35,6 @@
     <div class="sec src">
       <div class="f" id="srcFile">—</div>
       <div class="m" id="srcSummary">—</div>
-      <div class="m" id="iotLine">—</div>
       <span class="tag" id="agentTag">初始化中…</span>
     </div>
   </aside>
@@ -81,6 +82,22 @@
         <button type="button" class="mini" id="btnReloadAudit">刷新</button>
       </header>
       <div class="pane" id="auditPane"></div>
+    </section>
+
+    <section class="view" id="view-skills">
+      <header class="top">
+        <h1>技能管理</h1>
+        <button type="button" class="mini" id="btnReloadSkills">刷新</button>
+      </header>
+      <div class="pane" id="skillPane"></div>
+    </section>
+
+    <section class="view" id="view-artifacts">
+      <header class="top">
+        <h1>产物中心</h1>
+        <button type="button" class="mini" id="btnReloadArt">刷新</button>
+      </header>
+      <div class="pane" id="artPane"></div>
     </section>
 
   </main>

@@ -4,7 +4,6 @@
   "brand": {
     "product": "箭牌智家 AI 助手",
     "vendor": "ARROW 箭牌卫浴",
-    "tagline": "DuMate Agent 驱动",
     "emptyTitle": "说一句话，就能管设备、建场景、查产品",
     "emptyDesc": "设备控制走安全闸门：低危直接下发，高危先弹二次确认，每一步都留审计。"
   },
@@ -25,43 +24,34 @@
   "agent": {
     "name": "箭牌智家 AI 助手",
     "description": "箭牌卫浴 · 智家 AI 助手（DuMate Agent API 演示）：设备控制 / 场景创建 / 产品百科 / 报修引导",
-    "system": "你是「箭牌智家 AI 助手」，服务箭牌智能卫浴的用户。你能查设备、控设备、建场景、答产品问题、引导报修。\n\n先 ls files/ 找到「设备与指令清单」并读完它。deviceName、cmd、param、value 一律逐字用清单里的值，不要改写、不要猜、不要用 1/0/true 代替 on/off。\n\n需要动设备时，在回答末尾附一个 iot 代码块，块内是 JSON，一次只输出一个块：\n控设备：{\"action\":\"device.control\",\"targets\":[{\"deviceName\":\"...\",\"cmd\":\"...\",\"param\":\"...\",\"value\":\"...\"}],\"say\":\"一句话说明要做什么\"}\n建场景：{\"action\":\"scene.create\",\"conditionList\":[{...}],\"actionList\":[{...}],\"say\":\"...\"}\n报修：{\"action\":\"repair.open\",\"kind\":\"report\" 或 \"progress\",\"say\":\"...\"}\n\n规则：\n1. 用户说法含糊、或清单里有多台设备可能命中时，先反问确认，不要猜。\n2. 你只输出结构化意图，不判断风险等级，也不要声称已经执行。能不能下发由安全闸门决定。\n3. 清单里没有的设备、指令或取值，直接说做不到，不要用相近的值凑。\n4. 答产品问题只依据挂载的资料。资料里没有的，说资料里没有，不要编参数。\n5. 回复用简体中文，先给结论，简短，不要堆列表。",
+    "system": "你是「箭牌智家 AI 助手」，服务箭牌智能卫浴的用户。你能查设备、控设备、建场景、答产品问题、引导报修、整理报表。\n\n先 ls files/ 找到「设备与指令清单」并读完它。deviceName、cmd、param、value 一律逐字用清单里的值，不要改写、不要猜、不要用 1/0/true 代替 on/off。\n\n需要动设备时，在回答末尾附一个 iot 代码块，块内是 JSON，一次只输出一个块：\n控设备：{\"action\":\"device.control\",\"targets\":[{\"deviceName\":\"...\",\"cmd\":\"...\",\"param\":\"...\",\"value\":\"...\"}],\"say\":\"一句话说明要做什么\"}\n建场景：{\"action\":\"scene.create\",\"conditionList\":[{...}],\"actionList\":[{...}],\"say\":\"...\"}\n报修：{\"action\":\"repair.open\",\"kind\":\"report\" 或 \"progress\",\"say\":\"...\"}\n\n规则：\n1. 用户说法含糊、或清单里有多台设备可能命中时，先反问确认，不要猜。\n2. 你只输出结构化意图，不判断风险等级，也不要声称已经执行。能不能下发由安全闸门决定。\n3. 清单里没有的设备、指令或取值，直接说做不到，不要用相近的值凑。\n4. 答产品问题只依据挂载的资料。资料里没有的，说资料里没有，不要编参数。\n5. 回复用简体中文，先给结论，简短，不要堆列表。\n6. 用户要清单、表格或报告这类可下载的东西时，用已加载的技能生成真实文件，在回答里说明文件名。不要拿对话里的表格当交付物。",
     "files": ["data/箭牌产品知识库.md"],
-    "skills": []
+    "skills": ["xlsx"],
+    "skillsNote": "按技能名挂载，bootstrap 时去平台技能库解析成 {skillID, releaseID}。名字写错会在启动日志里报出来，不会静默挂空气。"
   },
 
   "starters": [
-    "把主卫的浴霸暖风打开",
-    "把主卫坐便器的热水温度调到 40 度",
+    "把主卫的浴缸进水打开",
+    "把主卫坐便器的大冲打开",
+    "把主卫镜柜的夜灯打开",
     "每天晚上 10 点自动给主卫浴缸放水",
-    "AKB1357 的水温能调到多少度？",
-    "我家坐便器不出水了，要报修"
+    "AKB1357 有哪些功能？",
+    "我家坐便器不出水了，要报修",
+    "把主卫所有设备的状态整理成一份表格"
   ],
 
   "riskRules": [
     {
-      "when": { "cmd": "switch_valve" },
+      "when": { "cmd": "switch_water_in" },
       "level": "H",
-      "label": "水阀开关",
-      "basis": "需求 3.4 点名高危"
-    },
-    {
-      "when": { "cmd": "set_water_temp" },
-      "level": "H",
-      "label": "热水温度上限调节",
-      "basis": "需求 3.4 点名高危"
-    },
-    {
-      "when": { "cmd": "set_warm_air_temp" },
-      "level": "H",
-      "label": "浴霸温度调节",
-      "basis": "demo 预置，待箭牌给指令集后确认"
+      "label": "浴缸进水阀开关",
+      "basis": "需求 3.4 点名的「水阀开关」"
     },
     {
       "when": { "param": "switch" },
       "level": "M",
       "label": "常规开关",
-      "basis": "接口文档示例指令，可逆"
+      "basis": "官方指令集里的开关类指令，可逆"
     }
   ],
 
@@ -75,46 +65,55 @@
 
   "commands": [
     {
-      "cmd": "switch",
-      "params": { "switch": ["on", "off"] },
-      "desc": "开关设备",
-      "appliesTo": ["01", "02", "04", "06"],
-      "source": "doc"
-    },
-    {
       "cmd": "switch_watering",
       "params": { "switch": ["on"] },
-      "desc": "坐便器冲水",
+      "desc": "马桶大冲",
       "appliesTo": ["01"],
       "source": "doc"
     },
     {
-      "cmd": "switch_warm_air",
+      "cmd": "switch_night_light",
       "params": { "switch": ["on", "off"] },
-      "desc": "浴霸暖风",
-      "appliesTo": ["02"],
+      "desc": "夜灯（马桶与镜柜）",
+      "appliesTo": ["01", "06"],
+      "source": "doc",
+      "platform": "官方说明页只写 01，实测 06 镜柜也收，按平台放开"
+    },
+    {
+      "cmd": "switch_auto_closing",
+      "params": { "switch": ["on", "off"] },
+      "desc": "马桶自动翻盖",
+      "appliesTo": ["01"],
       "source": "doc"
     },
     {
-      "cmd": "set_water_temp",
-      "params": { "temperature": ["30", "32", "34", "36", "38", "40"] },
-      "desc": "坐便器热水温度档位",
-      "appliesTo": ["01"],
-      "source": "demo-only"
-    },
-    {
-      "cmd": "set_warm_air_temp",
-      "params": { "temperature": ["30", "35", "40"] },
-      "desc": "浴霸温度档位",
-      "appliesTo": ["02"],
-      "source": "demo-only"
-    },
-    {
-      "cmd": "switch_valve",
+      "cmd": "switch_kicking",
       "params": { "switch": ["on", "off"] },
-      "desc": "进水阀门开关",
-      "appliesTo": ["01", "04"],
-      "source": "demo-only"
+      "desc": "马桶脚触感应",
+      "appliesTo": ["01"],
+      "source": "doc"
+    },
+    {
+      "cmd": "switch_auto_oiling_porcelain",
+      "params": { "switch": ["on", "off"] },
+      "desc": "马桶自动润瓷",
+      "appliesTo": ["01"],
+      "source": "doc"
+    },
+    {
+      "cmd": "switch_onoff",
+      "params": { "switch": ["on", "off"] },
+      "desc": "开关",
+      "appliesTo": ["01", "04", "06"],
+      "source": "doc",
+      "platform": "官方说明页把它挂在 03 毛巾架下，实测 01/04/06 三个品类全收，按平台放开；真实环境没有 03 设备"
+    },
+    {
+      "cmd": "switch_water_in",
+      "params": { "switch": ["on", "off"] },
+      "desc": "浴缸进水",
+      "appliesTo": ["04"],
+      "source": "doc"
     }
   ],
 

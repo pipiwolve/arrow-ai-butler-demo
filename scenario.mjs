@@ -28,8 +28,8 @@ for (const k of ['confirmAtOrAbove', 'denyAtOrAbove', 'defaultRiskLevel']) {
 if (!SCENARIO.commands?.length) throw new Error('commands 不能为空，闸门靠它校验参数');
 
 // 设备清单有两份，用途不同，别混：
-//   demo —— 演示用。deviceName 取自接口文档样例，含 room 与「部分在线」的演示态。
-//           真实测试家庭里 11 台全部离线、也没有浴霸，全离线就演示不出成功下发。
+//   demo —— 演示用。设备与真实测试家庭是同一批，另加 room 与「部分在线」的演示态。
+//           真实测试家庭里 11 台全部离线，全离线就演示不出成功下发。
 //   real —— 联调/验收用。从真实接口抓下来的快照，只有接口真会返回的字段，
 //           没有 room（接口不返回），在线态是抓取那一刻的真值。
 // 用 IOT_FIXTURE 选。先看命令行，再看 .env——

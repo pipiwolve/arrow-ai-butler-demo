@@ -5,7 +5,9 @@
 //   GET  /ext/v3/ai/device-list?homeId=     设备列表
 //   POST /ext/v3/ai/control                 设备控制
 //   POST /ext/v3/ai/scene                   场景创建
-//   GET  /ext/v3/ai/scene-list              场景列表（demo 补充，接口文档没有）
+//
+// 只有这三个。曾经多挂过 /scene-list 与 /demo-state 两个「demo 补充接口」，
+// 真实平台没有，切真实网关后一个必然 404、一个用来撑演示面板，都撤了。
 //
 // 请求头（文档要求）：
 //   Authorization: bearer <token>
@@ -55,17 +57,9 @@ function validateCmd(state, commands, item) {
   return null;
 }
 
-// 下发一条 cmd，并更新内存态。真实网关这里是异步下发，mock 里同步生效
+// 下发一条 cmd。真实网关这里是异步下发，mock 里同步收下就算成功
 function applyCmd(state, item) {
-  const dev = state.get(item.deviceName);
-  const before = dev.status?.[item.param];
-  dev.status = { ...(dev.status || {}), [item.param]: item.value };
-  if (item.cmd === 'switch' || item.cmd === 'switch_valve') {
-    dev.power = item.value;
-    dev.onlineStatus = item.value === 'on' ? 1 : dev.onlineStatus;
-  }
-  if (item.cmd === 'switch_warm_air' && item.value === 'on') dev.warmAir = 'on';
-  return { deviceName: item.deviceName, cmd: item.cmd, param: item.param, value: item.value, before: before ?? null };
+  return { deviceName: item.deviceName, cmd: item.cmd, param: item.param, value: item.value };
 }
 
 const readBody = async (req) => {
@@ -156,21 +150,6 @@ export function createGateway({ commands, fixture = DEFAULT_FIXTURE(), log = () 
       scenes.unshift(scene);
       log('scene', `创建 ${scene.sceneId}（${scene.trigger}）`);
       return send(res, 200, ok(scene));
-    }
-
-    // ---- GET 场景列表（demo 补充接口，接口文档未提供）----
-    if (p === '/ext/v3/ai/scene-list' && method === 'GET') {
-      return send(res, 200, ok(scenes));
-    }
-
-    // ---- GET 设备运行态（demo 补充接口，接口文档未提供）----
-    // 真实 device-list 只返回 onlineStatus，不返回开关态。这里是为了让演示面板
-    // 能立刻看到「刚下发的指令生效了」，不属于对外契约。
-    if (p === '/ext/v3/ai/demo-state' && method === 'GET') {
-      return send(res, 200, ok([...state.values()].map((d) => ({
-        deviceName: d.deviceName, onlineStatus: d.onlineStatus, power: d.power || null,
-        warmAir: d.warmAir || null, status: d.status || null,
-      }))));
     }
 
     return send(res, 404, fail(`没有这个接口：${method} ${p}`, 404));

@@ -1,6 +1,7 @@
 // 箭牌智家 AI 助手 · 前端
-// 三个视图：对话 / 家庭设备 / 安全审计。
+// 五个视图：对话 / 家庭设备 / 安全审计 / 技能管理 / 产物中心。
 // 对话一屏里能看到三层：执行过程（Agent 干了什么）、安全闸门（能不能下发）、正文（结论）。
+// 技能与产物是一条线：技能是上游，挂上之后才有真文件可交付。
 
 const $ = (s) => document.querySelector(s);
 const el = (tag, cls, txt) => {
@@ -82,11 +83,13 @@ const CATS = {
   websearch: { k: 'net', label: '联网搜索' },
   task: { k: 'task', label: '派子任务' },
   skill: { k: 'skill', label: '加载技能' },
+  file_export: { k: 'write', label: '导出文件' },
 };
 
-// 纯内部记账的片段，展示出来只是噪音
+// 纯内部记账的片段，展示出来只是噪音。
+// file_export 不在里面：它产出的是真交付物，要让人在过程里看见。
 const HIDDEN = new Set([
-  'todowrite', 'requirementwrite', 'requirementread', 'file_export',
+  'todowrite', 'requirementwrite', 'requirementread',
   'step-start', 'step-finish', 'snapshot', 'patch', 'compaction', 'retry', 'file-import',
 ]);
 
@@ -135,6 +138,12 @@ function toolLabel(tool, r) {
       return p ? CATS[tool].label + ' ' + clip(relPath(p), 58) : CATS[tool].label;
     }
     case 'ls': return '列目录 ' + clip(relPath(inp.path || inp.dir || '.'), 58);
+    case 'file_export': {
+      // 一次导出可以带多个文件，input.files 是数组
+      const f = inp.files?.[0] || inp;
+      const p = f.path || f.filePath || f.filename;
+      return p ? '导出 ' + clip(relPath(p), 58) : '导出文件';
+    }
     case 'glob': return '查找 ' + clip(flat(inp.pattern || inp.glob || ''), 50);
     case 'grep': return '搜索 ' + clip(flat(inp.pattern || ''), 46);
     case 'task': return '派子任务 ' + clip(flat(inp.description || inp.prompt || ''), 46);
@@ -223,6 +232,8 @@ function newTurn(live) {
     msgIds: new Set(),
     live, running: live, startedAt: Date.now(), endedAt: 0,
     open: false, manual: false, openRows: new Set(), override: null, pendings: new Map(),
+    // 产物卡按沙箱路径索引：下载地址晚一步才到，靠它把地址贴回对应的卡
+    artCards: new Map(),
   };
   head.onclick = () => { t.open = !t.open; t.manual = true; paintActs(t); };
   return t;
@@ -493,6 +504,104 @@ function addRepairCard(t, d) {
   scrollBottom();
 }
 
+/* ================= 产物卡 ================= */
+
+// 下载地址是平台签发的临时地址，落盘没有意义，只能在点的时候现取。
+// 服务端在一轮收尾时会补推一次（demo.artifact.ready），补不上就靠这个按钮兜底。
+async function artifactUrl(sessionId, filePath) {
+  const q = new URLSearchParams({ sessionId: sessionId || '', path: filePath });
+  const r = await fetch('/api/artifacts/resolve?' + q);
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+  return d;
+}
+
+const artLink = (url, text) => {
+  const a = el('a', 'mini', text);
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  return a;
+};
+
+// 「取地址 → 变链接」这一段卡片和产物中心的表格是同一套行为，写一处。
+// onInfo 是给会话内那张卡的：取回来的地址里还带着体积和格式，顺手回填到卡片上。
+function urlSlot(sessionId, filePath, onInfo) {
+  const box = el('div', 'rowacts');
+  let urls = { url: '', preview: '' };
+  let busy = false;
+  let err = '';
+
+  const paintAct = () => {
+    box.innerHTML = '';
+    if (err) box.append(el('span', 'hint', err));
+    if (urls.url) {
+      box.append(artLink(urls.url, '下载'));
+      if (urls.preview) box.append(artLink(urls.preview, '预览'));
+      return;
+    }
+    const b = el('button', 'mini', busy ? '获取中…' : '获取下载地址');
+    b.type = 'button';
+    b.disabled = busy;
+    b.onclick = async () => {
+      if (busy) return;
+      busy = true; err = '';
+      paintAct();
+      try {
+        const d = await artifactUrl(sessionId, filePath);
+        urls = { url: d.downloadUrl || '', preview: d.previewUrl || '' };
+        if (!urls.url) err = '平台还没登记这个文件';
+        else if (onInfo) onInfo(d);
+      } catch (e) {
+        err = '取不到：' + String(e.message || e);
+      }
+      busy = false;
+      paintAct();
+    };
+    box.append(b);
+  };
+
+  paintAct();
+  return {
+    box,
+    set: (d) => {
+      urls = { url: d.downloadUrl || '', preview: d.previewUrl || '' };
+      err = '';
+      if (onInfo) onInfo(d);
+      paintAct();
+    },
+  };
+}
+
+function addArtifactCard(t, a) {
+  const card = el('div', 'artifact');
+  const h = el('div', 'artifact-h');
+  h.append(el('span', 'ico', '⇣'));
+  h.append(el('span', 'fn', a.filename || baseName(a.path)));
+  // 体积和格式来自 path-map，实时这一轮要到补推 demo.artifact.ready 才有
+  const meta = el('div', 'artifact-m');
+  const paintMeta = (d) => {
+    const rel = a.relativePath || relPath(a.path);
+    meta.textContent = [
+      rel && rel !== (a.filename || '') ? rel : '',
+      d?.mimeType || a.mimeType,
+      fmtSize(d?.size ?? a.size),
+      a.sessionId ? '会话 ' + String(a.sessionId).slice(-8) : '',
+      a.at ? fmtWhen(a.at) : '',
+    ].filter(Boolean).join(' · ');
+  };
+  paintMeta();
+  const slot = urlSlot(a.sessionId, a.path, paintMeta);
+  slot.box.classList.add('act');
+  h.append(slot.box);
+  card.append(h);
+  card.append(meta);
+  t.artCards.set(a.path, slot);
+  t.cardsEl.append(card);
+  scrollBottom();
+  return card;
+}
+
 /* ================= markdown ================= */
 
 function mdToHtml(md) {
@@ -544,8 +653,8 @@ function addUser(text) {
 
 function addTurn(t) { ensureWrap().append(t.root); scrollBottom(); return t; }
 
-// 五条推荐问各自打一个场景标签，客户一眼看出覆盖了四个核心场景
-const STARTER_TAG = ['设备控制', '高危指令 · 二次确认', '场景创建', '产品百科', '报修引导'];
+// 六条推荐问各自打一个场景标签，客户一眼看出覆盖了五个核心场景
+const STARTER_TAG = ['设备控制', '高危指令 · 二次确认', '场景创建', '产品百科', '报修引导', '生成交付物'];
 
 function showEmpty() {
   streamEl.innerHTML = '';
@@ -646,6 +755,13 @@ function handleEvent(ev, d, t) {
     case 'demo.repair':
       addRepairCard(t, d);
       loadAuditCount();
+      break;
+    case 'demo.artifact':
+      addArtifactCard(t, d);
+      break;
+    // 收尾时补推的临时下载地址，贴回对应的产物卡
+    case 'demo.artifact.ready':
+      t.artCards.get(d?.path)?.set(d);
       break;
     case 'demo.done':
       endTurn(t, !!d?.incomplete, null, d?.pendingId);
@@ -802,6 +918,10 @@ function replayCards(turns, recs) {
         if (r.event === 'demo.gate') addGateCard(t, r.data, true);
         else if (r.event === 'demo.exec') addExecCard(t, r.data);
         else if (r.event === 'demo.repair') addRepairCard(t, r.data);
+        // 落盘的是没带下载地址的那份，回看时点「获取下载地址」现取。
+        // sessionId 只在回合记录里有：早先写下的流水里那张卡是光秃秃的，
+        // 少了它按钮会带着空 sessionId 去请求，回放里永远取不到地址。
+        else if (r.event === 'demo.artifact') addArtifactCard(t, { sessionId: rec.sessionId, ...r.data });
       }
     } else if (rec.pendingId) resolves.push(rec);
   }
@@ -883,9 +1003,9 @@ async function loadDevices(quiet) {
 
   const c = el('div', 'card');
   const tb = el('table', 'grid');
-  tb.innerHTML = '<thead><tr><th>房间</th><th>设备名</th><th>deviceName</th><th>品类</th><th>状态</th><th>演示态</th></tr></thead>';
+  tb.innerHTML = '<thead><tr><th>房间</th><th>设备名</th><th>deviceName</th><th>品类</th><th>状态</th></tr></thead>';
   const tbody = el('tbody');
-  const catName = (code) => ({ '01': '坐便器', '02': '浴霸', '04': '浴缸', '06': '镜柜' }[code] || code);
+  const catName = (code) => ({ '01': '马桶', '04': '浴缸', '06': '镜柜' }[code] || code);
   for (const d of dev.data) {
     const tr = el('tr', d.onlineStatus ? '' : 'off');
     const td = (txt, cls) => { const n = el('td', cls || null); n.textContent = txt; return n; };
@@ -899,9 +1019,6 @@ async function loadDevices(quiet) {
     const st = el('td');
     st.append(el('span', 'pill' + (d.onlineStatus ? ' on' : ''), d.onlineStatus ? '在线' : '离线'));
     tr.append(st);
-    const pw = el('td', 'mono');
-    pw.textContent = d.power ? `switch=${d.power}` : (d.status ? Object.entries(d.status).map(([k, v]) => `${k}=${v}`).join(' ') : '—');
-    tr.append(pw);
     tbody.append(tr);
   }
   tb.append(tbody);
@@ -910,14 +1027,15 @@ async function loadDevices(quiet) {
 
   const sc2 = el('div', 'card');
   sc2.append(el('h3', null, `已创建场景（${sc.data.length}）`));
+  sc2.append(el('div', 'hint', '平台的场景接口只有「创建」没有「查询」，所以这一屏列的是本会话建过的场景，来自本地审计流水。'));
   if (!sc.data.length) {
     sc2.append(el('div', 'hint', '还没有场景。在对话里说一句「每天晚上 10 点自动给主卫浴缸放水」试试。'));
   }
   for (const s of sc.data) {
     const row = el('div', 'kv');
     row.append(el('span', 'k', s.trigger === 'schedule' ? '定时' : '手动'));
-    row.append(el('span', 'v mono',
-      `${s.sceneId} · 条件 ${s.conditionList.map((c) => `${c.cmd}${c.time ? '@' + c.time : ''}`).join(',')} → 执行 ${s.actionList.map((a) => `${a.cmd}=${a.value}`).join(',')}`));
+    const fmt = (list) => (list || []).map((c) => `${c.cmd}${c.value !== undefined ? '=' + c.value : ''}${c.time ? '@' + c.time : ''}`).join(',') || '—';
+    row.append(el('span', 'v mono', `${s.sceneId} · 条件 ${fmt(s.conditionList)} → 执行 ${fmt(s.actionList)}`));
     sc2.append(row);
   }
   p.append(sc2);
@@ -973,6 +1091,354 @@ async function loadAuditCount() {
   } catch {}
 }
 
+/* ================= 技能管理 ================= */
+
+// 技能库是整个租户共享的（含 99 个内置技能），这里的增删改动的是真实平台资源。
+// Agent 挂载的是 { skillID, releaseID } 两个 ID，界面上要看得懂，名字回技能库补一次。
+const SK = { list: [], total: 0, keyword: '', page: 1, pageSize: 20, agent: null, mounted: new Set() };
+
+async function postJson(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+  return d;
+}
+
+// 加挂 / 摘除。走 POST /agents/{id}，带 version 乐观锁，服务端会把新版本写回 state.json
+const agentSkill = (skillID, releaseID, name, action) => postJson('/api/agent/skills', { skillID, releaseID, name, action });
+
+function skillMountBtn(id, releaseID, name, mounted) {
+  const b = el('button', 'mini', mounted ? '摘除' : '挂载');
+  b.type = 'button';
+  b.title = mounted ? '从本场景 Agent 上摘掉（不动技能库）' : '挂到本场景 Agent 上';
+  b.onclick = async () => {
+    b.disabled = true;
+    b.textContent = '…';
+    try {
+      await agentSkill(id, releaseID, name, mounted ? 'remove' : 'add');
+      await paintSkills();
+    } catch (e) {
+      b.disabled = false;
+      b.textContent = '失败';
+      b.title = String(e.message || e);
+    }
+  };
+  return b;
+}
+
+// 删技能是真实平台资源，挂载它的 Agent 也会受影响，所以按两下才算确认。
+// 技能增删不动设备，不进安全审计那条流水（audit.jsonl 只记设备与场景操作）。
+function skillDeleteBtn(s) {
+  const b = el('button', 'mini', '删除');
+  b.type = 'button';
+  let armed = 0;
+  b.onclick = async () => {
+    if (!armed) {
+      armed = setTimeout(() => { armed = 0; b.textContent = '删除'; }, 4000);
+      b.textContent = '确认删除';
+      return;
+    }
+    clearTimeout(armed);
+    b.disabled = true;
+    b.textContent = '删除中…';
+    try {
+      const r = await fetch('/api/skills/' + encodeURIComponent(s.id), { method: 'DELETE' });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+      await paintSkills();
+    } catch (e) {
+      b.disabled = false;
+      b.textContent = '失败';
+      b.title = String(e.message || e);
+    }
+  };
+  return b;
+}
+
+// 更新技能：换源（URL）或传包（ZIP）。默认收起来，展开就多一行，不然每行四个按钮太吵
+function skillUpdateRow(s) {
+  const tr = el('tr', 'sub');
+  tr.style.display = 'none';
+  const cell = el('td');
+  cell.colSpan = 5;
+
+  const msg = el('div', 'hint', '换源与传包都只改技能内容，已挂载的 Agent 下次对话即用新版。');
+  const note = (t, bad) => { msg.textContent = t; msg.className = 'hint' + (bad ? ' err' : ''); };
+  const submit = async (btn, label, fn) => {
+    btn.disabled = true;
+    btn.textContent = '提交中…';
+    try {
+      await fn();
+      note('更新成功。');
+      setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 600);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = label;
+      note(String(e.message || e), true);
+    }
+  };
+
+  const r1 = el('div', 'rowline');
+  const url = el('input', 'find');
+  url.type = 'url';
+  url.placeholder = '换源：填新的 GitHub / ClawHub / BOS 地址';
+  const go = el('button', 'mini', '换源');
+  go.type = 'button';
+  go.onclick = () => {
+    const u = url.value.trim();
+    if (!u) return note('先填地址', true);
+    submit(go, '换源', () => postJson('/api/skills/' + encodeURIComponent(s.id), { url: u }));
+  };
+  r1.append(url, go);
+
+  // 新建只收 URL，ZIP 这条路只在更新时存在，所以它挂在这一行下面而不是上面的新建表单里
+  const r2 = el('div', 'rowline');
+  const file = el('input', 'filein');
+  file.type = 'file';
+  file.accept = '.zip,application/zip';
+  const up = el('button', 'mini', '传包更新');
+  up.type = 'button';
+  up.onclick = () => {
+    const f = file.files?.[0];
+    if (!f) return note('先选一个 .zip', true);
+    const fd = new FormData();
+    fd.append('file', f);
+    submit(up, '传包更新', async () => {
+      const r = await fetch('/api/skills/' + encodeURIComponent(s.id) + '/zip', { method: 'POST', body: fd });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+      return d;
+    });
+  };
+  r2.append(file, up);
+
+  cell.append(r1, r2, msg);
+  tr.append(cell);
+  return { tr, toggle: () => { tr.style.display = tr.style.display === 'none' ? '' : 'none'; } };
+}
+
+async function loadSkills() {
+  const box = $('#skillPane');
+  box.innerHTML = '';
+  const p = el('div', 'pane-inner');
+  p.append(el('div', 'hint', '读取技能库…'));
+  box.append(p);
+  await paintSkills();
+}
+
+async function paintSkills() {
+  const box = $('#skillPane');
+  const q = new URLSearchParams({ page: String(SK.page), pageSize: String(SK.pageSize) });
+  if (SK.keyword) q.set('keyword', SK.keyword);
+
+  let lib = { data: [], total: 0 }, agent = null;
+  try { lib = await (await fetch('/api/skills?' + q)).json(); } catch {}
+  try { agent = await (await fetch('/api/agent')).json(); } catch {}
+
+  SK.list = lib.data || [];
+  SK.total = lib.total ?? SK.list.length;
+  SK.agent = agent;
+  SK.mounted = new Set((agent?.skills || []).map((s) => s.skillID));
+  $('#skillCount').textContent = SK.total || '';
+  if (agent?.agentId) $('#agentTag').textContent = `${agent.agentId} v${agent.version}`;
+
+  box.innerHTML = '';
+  const p = el('div', 'pane-inner');
+  box.append(p);
+  const td = (txt, cls) => { const n = el('td', cls || null); n.textContent = txt; return n; };
+
+  /* ---------- 本场景 Agent 的挂载 ---------- */
+  const ag = el('div', 'card');
+  ag.append(el('h3', null, '本场景 Agent 的挂载'));
+  if (!agent?.agentId) {
+    ag.append(el('div', 'hint', '读不到 Agent。先确认服务端 bootstrap 过。'));
+  } else {
+    const kv = (k, v, mono) => {
+      const row = el('div', 'kv');
+      row.append(el('span', 'k', k), el('span', 'v' + (mono ? ' mono' : ''), v));
+      ag.append(row);
+    };
+    kv('Agent', agent.agentId, true);
+    kv('版本', `v${agent.version}`);
+    kv('资料', (agent.files || []).map((f) => f.name).join('、') || '（无）');
+    kv('提示词', `${agent.systemChars} / ${CFG.agent?.systemLimit ?? 1000} 字`);
+
+    if (!(agent.skills || []).length) {
+      ag.append(el('div', 'hint', '一个技能都没挂。技能是产物的上游：挂上 xlsx，再让它整理一份表格，产物中心就会有真文件。'));
+    }
+    for (const s of agent.skills || []) {
+      const row = el('div', 'kv');
+      row.append(el('span', 'k', '已挂'));
+      const v = el('span', 'v');
+      v.append(el('b', 'sn', s.name || s.skillID));
+      // 名字给业务看，ID 给客户工程师对账，两个都要
+      v.append(el('div', 'sid', s.releaseID ? `${s.skillID} · release ${s.releaseID}` : s.skillID));
+      row.append(v);
+      const act = el('div', 'rowacts');
+      act.append(skillMountBtn(s.skillID, s.releaseID, s.name, true));
+      row.append(act);
+      ag.append(row);
+    }
+    ag.append(el('div', 'hint', '挂载改动会调 POST /agents/{id}（带 version 乐观锁）并写回 state.json。重启服务后以 config/scenario.json 点名的技能为准。'));
+  }
+  p.append(ag);
+
+  /* ---------- 技能库 ---------- */
+  const c = el('div', 'card');
+  c.append(el('h3', null, `技能库（${SK.total}）`));
+  c.append(el('div', 'hint', `搜索参数是 keyword，page / pageSize 都是必填。这里是整个租户的技能库，不只是挂给本场景的那些。`));
+
+  const findRow = el('div', 'rowline');
+  const inp = el('input', 'find');
+  inp.type = 'search';
+  inp.placeholder = '搜索技能名，例如 xlsx';
+  inp.value = SK.keyword;
+  const goSearch = () => { SK.keyword = inp.value.trim(); SK.page = 1; paintSkills(); };
+  const go = el('button', 'mini', '搜索');
+  go.type = 'button';
+  go.onclick = goSearch;
+  inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); goSearch(); } };
+  findRow.append(inp, go);
+  if (SK.keyword) {
+    const clr = el('button', 'mini', '清空');
+    clr.type = 'button';
+    clr.onclick = () => { SK.keyword = ''; SK.page = 1; paintSkills(); };
+    findRow.append(clr);
+  }
+  c.append(findRow);
+
+  const newRow = el('div', 'rowline');
+  const newUrl = el('input', 'find');
+  newUrl.type = 'url';
+  newUrl.placeholder = '新建技能：GitHub / ClawHub / BOS 地址';
+  const mk = el('button', 'mini primary', '新建');
+  mk.type = 'button';
+  const mkMsg = el('div', 'hint', '新建只能从地址安装（平台接口只收 JSON {url}）；ZIP 上传只在「更新」里可用，见每一行的「更新」。');
+  mk.onclick = async () => {
+    const u = newUrl.value.trim();
+    if (!u) { mkMsg.textContent = '先填地址'; mkMsg.className = 'hint err'; return; }
+    mk.disabled = true;
+    mk.textContent = '提交中…';
+    try {
+      const d = await postJson('/api/skills', { url: u });
+      mk.disabled = false;
+      mk.textContent = '新建';
+      newUrl.value = '';
+      mkMsg.className = 'hint';
+      mkMsg.textContent = `已提交${d?.id ? '：' + d.id : ''}，刷新生效。`;
+      SK.keyword = '';
+      await paintSkills();
+    } catch (e) {
+      mk.disabled = false;
+      mk.textContent = '新建';
+      mkMsg.className = 'hint err';
+      mkMsg.textContent = '新建失败：' + String(e.message || e);
+    }
+  };
+  newRow.append(newUrl, mk);
+  c.append(newRow, mkMsg);
+
+  if (!SK.list.length) {
+    c.append(el('div', 'hint', SK.keyword ? `没有名字里带「${SK.keyword}」的技能。` : '技能库没返回数据。'));
+  } else {
+    const tb = el('table', 'grid');
+    tb.innerHTML = '<thead><tr><th>技能</th><th>说明</th><th>版本</th><th>来源</th><th></th></tr></thead>';
+    const tbody = el('tbody');
+    for (const s of SK.list) {
+      const tr = el('tr');
+      const nm = el('td');
+      nm.append(el('b', 'sn', s.name));
+      nm.append(el('div', 'sid', s.id));
+      tr.append(nm);
+      tr.append(td(clip(flat(s.description || '—'), 76)));
+      tr.append(td(s.version || '—', 'mono'));
+      const src = el('td');
+      // 列表接口不返回 builtin（只有详情才有）。内置技能是平台同步进来的，
+      // createBy 形如 system:personal-sync，拿这个当判据；其余是租户自建的。
+      const sys = String(s.createBy || '').startsWith('system:');
+      src.append(el('span', 'pill' + (sys ? '' : ' on'), sys ? '内置' : (s.createBy || '自建')));
+      tr.append(src);
+      const act = el('td', 'acts-cell');
+      const acts = el('div', 'rowacts');
+      const mounted = SK.mounted.has(s.id);
+      acts.append(skillMountBtn(s.id, s.releaseId || '', s.name, mounted));
+      const upd = skillUpdateRow(s);
+      const ub = el('button', 'mini', '更新');
+      ub.type = 'button';
+      ub.onclick = () => upd.toggle();
+      acts.append(ub, skillDeleteBtn(s));
+      act.append(acts);
+      tr.append(act);
+      tbody.append(tr, upd.tr);
+    }
+    tb.append(tbody);
+    c.append(tb);
+  }
+  p.append(c);
+}
+
+/* ================= 产物中心 ================= */
+
+// 平台没有「列产物」接口，这一页比别的慢：要先列会话，再逐个会话问 path-map。
+// 下载地址是平台签发的临时地址，清单里不缓存，点的时候现取。
+const extOf = (n) => { const m = String(n || '').match(/\.([A-Za-z0-9]{1,5})$/); return m ? m[1].toLowerCase() : ''; };
+const fmtSize = (n) => (typeof n === 'number' && n > 0 ? (n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KB') : '');
+
+async function loadArtifacts() {
+  const box = $('#artPane');
+  box.innerHTML = '';
+  const p = el('div', 'pane-inner');
+  p.append(el('div', 'hint', '扫描最近的会话，逐个问 path-map…'));
+  box.append(p);
+
+  let d = { data: [], scanned: 0 };
+  try { d = await (await fetch('/api/artifacts?limit=100')).json(); } catch {}
+  const rows = d.data || [];
+  $('#artCount').textContent = rows.length || '';
+
+  box.innerHTML = '';
+  const p2 = el('div', 'pane-inner');
+  box.append(p2);
+  const td = (txt, cls) => { const n = el('td', cls || null); n.textContent = txt; return n; };
+
+  const c = el('div', 'card');
+  c.append(el('h3', null, `生成物（${rows.length}）`));
+  c.append(el('div', 'hint', `平台没有「列产物」的接口，这一页是逐个会话调 path-map（不传 path 就返回该会话的全部产物）拼出来的，扫了最近 ${d.scanned ?? 0} 个会话。`));
+  if (!rows.length) {
+    c.append(el('div', 'hint', '还没有产物。去对话里说「把主卫所有设备的状态整理成一份表格」——前提是本场景 Agent 挂了 xlsx 这类技能。'));
+    p2.append(c);
+    return;
+  }
+
+  const tb = el('table', 'grid');
+  tb.innerHTML = '<thead><tr><th>文件</th><th>类型</th><th>来源会话</th><th>会话时间</th><th></th></tr></thead>';
+  const tbody = el('tbody');
+  for (const a of rows) {
+    const tr = el('tr');
+    const f = el('td');
+    f.append(el('b', 'sn', a.filename || baseName(a.path)));
+    // 清单里的相对路径常常就是文件名本身，重复一遍只是噪声
+    const rel = relPath(a.path);
+    if (rel && rel !== (a.filename || '')) f.append(el('div', 'sid', rel));
+    tr.append(f);
+    // 平台给的 mimeType 一长串，表格里换扩展名 + 体积更好认
+    tr.append(td([extOf(a.filename), fmtSize(a.size)].filter(Boolean).join(' · ') || a.fileType || '—', 'mono'));
+    const s = el('td');
+    s.append(el('div', null, clip(a.title || '(未命名)', 30)));
+    s.append(el('div', 'sid', String(a.sessionId || '').slice(-8)));
+    tr.append(s);
+    // path-map 不带产物自己的时间，这里只能显示会话的更新时间
+    tr.append(td(fmtWhen(a.at) || '—', 'mono'));
+    const act = el('td');
+    act.append(urlSlot(a.sessionId, a.path).box);
+    tr.append(act);
+    tbody.append(tr);
+  }
+  tb.append(tbody);
+  c.append(tb);
+  p2.append(c);
+}
+
 /* ================= 视图切换 ================= */
 
 function switchView(name) {
@@ -981,6 +1447,8 @@ function switchView(name) {
   $('#secSessions').style.display = name === 'chat' ? '' : 'none';
   if (name === 'devices') loadDevices();
   if (name === 'audit') loadAudit();
+  if (name === 'skills') loadSkills();
+  if (name === 'artifacts') loadArtifacts();
 }
 
 /* ================= 输入 ================= */
@@ -1013,6 +1481,8 @@ $('#btnNew').onclick = () => {
 };
 $('#btnReloadDev').onclick = () => loadDevices();
 $('#btnReloadAudit').onclick = loadAudit;
+$('#btnReloadSkills').onclick = loadSkills;
+$('#btnReloadArt').onclick = loadArtifacts;
 $('#sessFind').oninput = paintSessions;
 
 for (const b of document.querySelectorAll('.nav button')) b.onclick = () => switchView(b.dataset.view);
@@ -1269,11 +1739,11 @@ window.addEventListener('blur', () => { if (MIC.on) stopRec(); });
     CFG = await (await fetch('/api/config')).json();
     document.title = `${CFG.brand.product} · ${CFG.brand.vendor}`;
     $('#brandProduct').textContent = CFG.brand.product;
-    $('#brandVendor').textContent = CFG.brand.vendor + ' · ' + (CFG.brand.tagline || 'DuMate Agent');
+    $('#brandVendor').textContent = CFG.brand.vendor;
     $('#srcFile').textContent = CFG.source.file;
     $('#srcSummary').textContent = CFG.source.summary;
-    // 设备清单有两份（demo / real），演示和联调的判断结果不一样，界面上必须看得见当前是哪份
-    $('#iotLine').textContent = `IoT 网关 ${CFG.iot?.mode === 'mock' ? '（本地 mock）' : '（真实环境）'} · homeId ${CFG.iot?.homeId ?? ''} · 清单 ${CFG.iot?.fixture === 'real' ? '真实快照' : '演示'}`;
+    // 侧栏不再显示网关模式与清单来源：那是给联调看的，客户面前不需要。
+    // 要查当前跑的是哪套，看 GET /api/config 的 iot.mode 与 iot.fixture
     // 没配 ASR Key 就把麦克风置灰，不要让人按下去才看到报错
     if (!CFG.voice?.enabled) {
       micBtn.disabled = true;

@@ -17,13 +17,28 @@
 //   GET  /api/iot/devices           家庭设备（走 IoT 网关真实接口）
 //   GET  /api/iot/scenes            已创建场景
 //   GET  /api/audit                 审计日志
+//
+//   —— 技能管理（平台技能库，不只是本场景） ——
+//   GET    /api/skills              技能库搜索 / 分页
+//   GET    /api/skills/:id          技能详情
+//   POST   /api/skills              {url} 新建（平台只收 GitHub / ClawHub / BOS 地址）
+//   POST   /api/skills/:id          {url} 换源更新
+//   POST   /api/skills/:id/zip      multipart（字段 file）传 ZIP 更新
+//   DELETE /api/skills/:id          删技能
+//   GET    /api/agent               本场景 Agent 的挂载实况
+//   POST   /api/agent/skills        {skillID, releaseID, action} 加挂 / 摘除技能
+//
+//   —— 生成物管理 ——
+//   GET  /api/artifacts             跨会话汇总的产物清单
+//   GET  /api/artifacts/resolve     取单个产物的临时下载地址（按会话拉 path-map 再取键）
 
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { SCENARIO, DEVICES, ROOT, FIXTURE_NAME } from './scenario.mjs';
 import { createGate } from './src/policy.mjs';
-import { createAudit } from './src/audit.mjs';
+import { createAudit, redact } from './src/audit.mjs';
 import { createJournal } from './src/journal.mjs';
 import { createIotClient } from './src/iot-client.mjs';
 import { createAsrClient } from './src/asr-client.mjs';
@@ -128,6 +143,59 @@ function agentUploads() {
   return [...SCENARIO.agent.files.map((f) => path.join(ROOT, f)), brief];
 }
 
+// ---------- 技能：名字 → ID ----------
+// Agent 挂载的是 { skillID, releaseID } 两个 ID，scenario.json 里写名字好维护。
+// 名字写错不静默跳过：日志里报出来，人一眼能看到少挂了一个。
+let wantedSkills = null; // 进程内缓存。每次提问都去查一遍没必要；重启会重新解析，技能发新版也能跟上
+
+async function resolveSkills(names = []) {
+  const out = [];
+  for (const name of names) {
+    let hit = null;
+    try {
+      const r = await api(`/skills?page=1&pageSize=20&keyword=${encodeURIComponent(name)}`);
+      hit = (r?.data || []).find((s) => s.name === name) || null;
+    } catch (e) {
+      console.warn(`[skills] 查「${name}」失败：${e.message}`);
+      continue;
+    }
+    if (!hit) {
+      console.warn(`[skills] 平台技能库里没有「${name}」，本次不挂载。检查 config/scenario.json 的 agent.skills。`);
+      continue;
+    }
+    out.push({ skillID: hit.id, releaseID: hit.releaseId || '', name: hit.name });
+  }
+  return out;
+}
+
+async function scenarioSkills(force = false) {
+  if (force || !wantedSkills) wantedSkills = await resolveSkills(SCENARIO.agent.skills || []);
+  return wantedSkills;
+}
+
+const skillKey = (list) => (list || []).map((s) => `${s.skillID}@${s.releaseID}`).join(',');
+const skillPayload = (list) => (list || []).map((s) => ({ skillID: s.skillID, releaseID: s.releaseID }));
+const promptKey = (s) => createHash('sha1').update(String(s)).digest('hex').slice(0, 12);
+
+// 改挂载、改提示词都走更新接口，不重建 Agent：重建会换掉 agentId，历史会话就找不回来了。
+// version 是乐观锁，必须带当前版本；数组按全量替换理解，没传的字段不动。
+async function updateAgent(st, patch) {
+  const body = { version: st.agentVersion };
+  if (patch.skills) body.skills = skillPayload(patch.skills);
+  if (patch.system) body.system = patch.system;
+
+  const r = await json(`/agents/${st.agentId}`, 'POST', body);
+  const next = {
+    ...st,
+    agentVersion: r?.version ?? st.agentVersion,
+    ...(patch.skills ? { skills: patch.skills, skillsKey: skillKey(patch.skills) } : {}),
+    ...(patch.system ? { promptKey: promptKey(patch.system) } : {}),
+    updatedAt: new Date().toISOString(),
+  };
+  writeState(next);
+  return next;
+}
+
 async function bootstrap({ force = false } = {}) {
   const st = readState();
   const uploads = agentUploads();
@@ -137,7 +205,28 @@ async function bootstrap({ force = false } = {}) {
   // 设备清单换了一套（demo ↔ real）时文件名不变、内容全变，所以还要比清单版本。
   // 漏了这一步，切到真实清单后模型手里还是那份演示设备表，认得的设备网关不认得。
   const fixtureKey = `${FIXTURE_NAME}:${DEVICES.devices.length}`;
-  if (!force && st.agentId && st.scenarioId === SCENARIO.id && want === have && st.fixtureKey === fixtureKey) return st;
+  // 清单文件的内容也要进 key。指令表改了（比如对齐客户的真实指令集）而清单名与台数都没变时，
+  // 只比 fixtureKey 会错误复用旧 Agent，模型手里还是旧指令，现场表现为「模型给的指令闸门不认」。
+  // 挂在最后一位的就是 agentUploads() 刚生成的那份清单。
+  const briefKey = createHash('sha1').update(fs.readFileSync(uploads[uploads.length - 1])).digest('hex').slice(0, 12);
+
+  const skills = await scenarioSkills(force);
+  const pKey = promptKey(SCENARIO.agent.system);
+  const reusable = !force && st.agentId && st.scenarioId === SCENARIO.id && want === have
+    && st.fixtureKey === fixtureKey && st.briefKey === briefKey;
+  if (reusable && st.skillsKey === skillKey(skills) && st.promptKey === pKey) return st;
+  if (reusable) {
+    // Agent 本身没变，变的是挂载的技能或提示词（改了 scenario.json，或技能页手动加减过）
+    const patch = {};
+    if (st.skillsKey !== skillKey(skills)) patch.skills = skills;
+    if (st.promptKey !== pKey) patch.system = SCENARIO.agent.system;
+    const next = await updateAgent(st, patch);
+    console.log(`[agent] 更新 v${st.agentVersion} → v${next.agentVersion}：`
+      + `${patch.skills ? '技能 ' + (skills.map((s) => s.name).join('/') || '(无)') : ''}`
+      + `${patch.skills && patch.system ? '，' : ''}`
+      + `${patch.system ? '提示词 ' + pKey : ''}`);
+    return next;
+  }
 
   const files = [];
   for (const abs of uploads) files.push(await uploadFile(abs));
@@ -147,19 +236,24 @@ async function bootstrap({ force = false } = {}) {
     description: SCENARIO.agent.description,
     system: SCENARIO.agent.system,
     files: files.map((f) => ({ fileID: f.fileID })),
-    skills: [],
+    skills: skillPayload(skills),
     mcpServers: [],
   });
 
   const next = {
     scenarioId: SCENARIO.id,
     fixtureKey,
+    briefKey,
     agentId: agent.id,
     agentVersion: agent.version,
     files: files.map((f) => ({ name: f.name, fileID: f.fileID })),
+    skills,
+    skillsKey: skillKey(skills),
+    promptKey: pKey,
     createdAt: new Date().toISOString(),
   };
   writeState(next);
+  if (skills.length) console.log(`[agent] 新建 v${next.agentVersion}，技能：${skills.map((s) => s.name).join('/')}`);
   return next;
 }
 
@@ -217,6 +311,8 @@ async function runTurn(sid, text, emit = () => {}) {
 
   let msgSent = false, sawBusy = false, complete = false;
   let answer = '', best = '';
+  // 这一轮导出的文件。平台没有「列产物」接口，只能从流里翻 file_export 那个 tool part
+  const artifacts = [];
   // 这一轮最后一条 assistant 消息的 ID。卡片要挂在这个锚点上，回放才能找回来。
   // 不用时间戳对齐：本地时钟和平台时钟不同源，回放时猜不准。
   let msgId = '';
@@ -243,6 +339,9 @@ async function runTurn(sid, text, emit = () => {}) {
         best = part.text;
         answer = best;
       }
+      for (const art of artifactsOf(part)) {
+        if (!artifacts.some((x) => x.path === art.path)) artifacts.push(art);
+      }
 
       const status = payload?.status?.type ?? payload?.status;
       if (evType === 'server.connected' && !msgSent) {
@@ -259,7 +358,85 @@ async function runTurn(sid, text, emit = () => {}) {
   } finally {
     clearTimeout(guard);
   }
-  return { complete, answer, msgId };
+  return { complete, answer, msgId, artifacts };
+}
+
+// ---------- 产物 ----------
+// 平台没有独立的产物列表接口，但会话级的 path-map 就是：不传 path 返回该会话的全部产物，
+// 返回体是以沙箱绝对路径为键的 map，值里带临时签名的 downloadUrl / previewUrl / pdfUrl。
+// （不传 path 返回 {} 只说明那个会话没有产物，不代表接口要给 path。）
+//
+// 消息历史里的 file_export part 仍然要用：它带这一轮的时间和文件名，
+// 会话内实时出卡要靠它，path-map 给不了时间。
+const ARTIFACT_SCAN = 25;
+
+async function artifactMap(sid) {
+  const r = await api(`/sessions/${sid}/artifact/path-map`);
+  const map = r?.data || r;
+  return map && typeof map === 'object' && !Array.isArray(map) ? map : {};
+}
+
+// 实测的 part 形状（一轮里会同时出现两个）：
+//   { type:"tool", tool:"file_export", state:{ metadata:{ fileExports:[{filename,path}] },
+//                                            input:{ files:[{path}] }, time:{start,end} } }
+//   { type:"file-export", files:[{filename,path}] }
+// 都是数组：一次导出可以带多个文件。两处都收，调用方按路径去重，保证不漏也不重。
+function artifactsOf(part) {
+  if (!part || typeof part !== 'object') return [];
+  let lists;
+  if (part.tool === 'file_export') lists = [part.state?.metadata?.fileExports, part.state?.input?.files];
+  else if (part.type === 'file-export') lists = [part.files];
+  else return [];
+
+  const out = [];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const f of list) {
+      const abs = f?.path || f?.filePath || '';
+      if (typeof abs !== 'string' || !abs) continue;
+      out.push({
+        path: abs,
+        filename: f.filename || f.name || path.basename(abs),
+        relativePath: f.relativePath || '',
+        at: part.state?.time?.end || part.state?.time?.start || null,
+      });
+    }
+  }
+  return out;
+}
+
+async function listArtifacts(limit) {
+  const sessions = await listSessions().catch(() => []);
+  const picked = sessions.slice(0, ARTIFACT_SCAN);
+  const rows = [];
+  // 串行翻 25 个会话要好几秒，分 5 个一批并发。翻不动的会话只记日志，不整页失败
+  for (let i = 0; i < picked.length; i += 5) {
+    const batch = await Promise.all(picked.slice(i, i + 5).map(async (s) => {
+      try {
+        const map = await artifactMap(s.id);
+        return Object.entries(map).map(([p, v]) => ({
+          path: v.path || p,
+          filename: v.filename || path.basename(p),
+          relativePath: v.relativePath || '',
+          mimeType: v.mimeType || '',
+          fileType: v.fileType || '',
+          size: v.size ?? null,
+          uploadStatus: v.uploadStatus || '',
+          previewStatus: v.previewStatus || '',
+          artifactID: v.artifactID || '',
+          sessionId: s.id,
+          title: s.metadata?.title || '(未命名)',
+          // path-map 不带时间，只能拿会话的更新时间当序。会话内那张产物卡用的是 part 自己的时间
+          at: s.updatedAt || s.createdAt || '',
+        }));
+      } catch (e) { console.error('[artifacts]', s.id, e.message); return []; }
+    }));
+    for (const one of batch) rows.push(...one);
+  }
+  // 同一个会话里同名同路径不会重复，但平台可能重复登记，去一次重
+  const byKey = new Map();
+  for (const r of rows) byKey.set(`${r.sessionId}::${r.path}`, r);
+  return [...byKey.values()].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, limit);
 }
 
 // ---------- 从回答里取结构化动作 ----------
@@ -321,6 +498,9 @@ async function execute(rec, { trigger, actor = 'app-user', sessionId }) {
     result: res.ok ? 'SUCCEEDED' : 'FAILED',
     error: res.error || null,
     ms: res.ms,
+    // 平台没有场景查询接口，设备页那屏只能列我们建过的，靠这里把条件与动作分开存下来，
+    // 不然 targets 是一锅烩，回看时分不出哪条是触发条件
+    ...(isScene ? { scene: { conditionList: rec.action.conditionList || [], actionList: rec.action.actionList || [] } } : {}),
   };
   audit.append(entry);
   return { ...entry, ok: res.ok };
@@ -360,12 +540,12 @@ async function readBody(req) {
 }
 
 // 语音是二进制裸 PCM，不能按 JSON 读
-async function readRawBody(req, limit = 4 * 1024 * 1024) {
+async function readRawBody(req, limit = 4 * 1024 * 1024, tooBig = '音频过大（上限 4MB，约 2 分钟）') {
   const chunks = [];
   let n = 0;
   for await (const c of req) {
     n += c.length;
-    if (n > limit) throw new Error('音频过大（上限 4MB，约 2 分钟）');
+    if (n > limit) throw new Error(tooBig);
     chunks.push(c);
   }
   return Buffer.concat(chunks);
@@ -415,8 +595,16 @@ async function handleAsk(req, res) {
   });
   const toClient = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
   // 卡片边推边攒，一轮收尾时整批落盘。只推不存，这几张卡回看历史时就没了
+  // 执行卡里带着网关请求头，先抹掉 bearer token 再推：落盘那侧 journal.write 也会抹一次，
+  // 但实时 SSE 是直接写进浏览器 Network 面板的，不在这里抹客户就能看见自家 token 的明文
   const cards = [];
-  const card = (type, data) => { cards.push({ event: type, data }); toClient(type, data); };
+  const card = (type, data) => {
+    const safe = redact(data);
+    cards.push({ event: type, data: safe });
+    toClient(type, safe);
+  };
+  // 这一轮导出的文件。产物卡即时推，下载地址要等平台登记，收尾时再补推一条
+  const exported = [];
 
   toClient('demo.session', { sessionId: sid, agentId: st.agentId, resumed: !!sessionId });
   console.log(`[ask] ${sessionId ? 'resume' : 'new'} ${sid} :: ${q.slice(0, 50)}`);
@@ -436,6 +624,12 @@ async function handleAsk(req, res) {
     // 无动作的那一轮也要发：前端拿到这个覆盖才不必靠「最长的 text part」猜正文，
     // 而那个猜法会把思考过程（reasoning，通常比正文长）当成回答。
     if (clean) toClient('demo.answer', { text: clean });
+
+    // 产物卡要发在动作分支之前：整理报表那一轮没有 iot 动作，会从下面第一个分支早退。
+    // 补 sessionId：runTurn 只管解析 part，不知道自己在哪个会话；前端取下载地址要用它。
+    exported.push(...(r.artifacts || []).map((a) => ({ ...a, sessionId: sid })));
+    for (const a of exported) card('demo.artifact', { ...a, downloadUrl: null });
+
     if (!action) {
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
@@ -487,6 +681,31 @@ async function handleAsk(req, res) {
     // 落盘放在最后：确认卡那一轮 cards 只有闸门卡，执行卡是用户点确认后才产生的，
     // 由 /api/confirm 另记一条 resolve，回放时再拼起来。
     journal.appendTurn({ sessionId: sid, msgId, cards });
+    // 补推下载地址。四条早退分支都会流到这里，写一处就够。
+    // demo.done 已经发过了，这里多等几秒不会让界面卡在「思考中」；
+    // 这条例外事件不进 cards，临时签名地址落盘没有意义，回放时前端自己再取一次。
+    //
+    // 平台侧登记是异步的，所以最多试三次；每次只拉一次 path-map（不传 path 就是该会话的全量），
+    // 不要一个产物一次调用。
+    for (let i = 0; i < 3 && !aborted && exported.some((a) => !a.ready); i++) {
+      if (i) await new Promise((r) => setTimeout(r, 2000));
+      let map;
+      try { map = await artifactMap(sid); } catch { continue; }
+      const vals = Object.values(map);
+      for (const a of exported) {
+        if (a.ready || aborted) continue;
+        const v = map[a.path] || vals.find((x) => x.filename === a.filename);
+        if (!v?.downloadUrl) continue;
+        a.ready = true;
+        try {
+          toClient('demo.artifact.ready', {
+            sessionId: sid, path: a.path,
+            downloadUrl: v.downloadUrl, previewUrl: v.previewUrl || '', pdfUrl: v.pdfUrl || '',
+            mimeType: v.mimeType || '', size: v.size ?? null,
+          });
+        } catch { /* 客户端已经走了，前端那个手动取的按钮兜底 */ }
+      }
+    }
     res.end();
   }
 }
@@ -535,11 +754,110 @@ async function handleConfirm(req, res) {
     gate.settle(pendingId, out.ok ? 'SUCCEEDED' : 'FAILED');
     // 回放时靠这条把待确认卡改成「已确认」，并补出确认后才有的那张执行卡
     journal.appendResolve({ sessionId, pendingId, decision: 'approve', out });
-    return sendJson(res, 200, out);
+    // out 里有 iotRequest.headers.Authorization。journal 和 audit 落盘前都会抹掉，
+    // 这条响应是直接回给浏览器的，漏了就会让客户在自己的 Network 面板里看见自家 token。
+    return sendJson(res, 200, redact(out));
   } catch (e) {
     gate.settle(pendingId, 'FAILED');
     return sendJson(res, 500, { error: String(e.message || e) });
   }
+}
+
+// ---------- 技能管理 ----------
+// 技能库是整个租户共享的（含 99 个内置技能），这里的增删改动的是真实平台资源，
+// 不是本地 mock。演示前想清楚再点。
+async function handleSkillWrite(req, res, skillId) {
+  const { url: src } = await readBody(req);
+  if (!src || typeof src !== 'string') {
+    return sendJson(res, 400, { error: '新建和换源都只收 JSON {url}，地址可以是 GitHub / ClawHub / BOS' });
+  }
+  let r;
+  try {
+    r = skillId ? await json(`/skills/${skillId}`, 'POST', { url: src }) : await json('/skills', 'POST', { url: src });
+  } catch (e) {
+    // 地址是用户自己填的，平台挑地址的毛病（4xx）不该在界面上显示成 500
+    const code = e.status >= 400 && e.status < 500 ? e.status : 500;
+    return sendJson(res, code, { error: e.message });
+  }
+  console.log(`[skills] ${skillId ? '换源' : '新建'} ${skillId || r?.id} <- ${src}`);
+  return sendJson(res, 200, r || {});
+}
+
+// ZIP 只在更新时收（multipart，字段名 file），新建只能给 URL。
+// 这里原样转发字节和 content-type（里面带着 boundary），不重新拼 multipart。
+async function handleSkillZip(req, res, skillId) {
+  const ct = req.headers['content-type'] || '';
+  if (!ct.startsWith('multipart/form-data')) {
+    return sendJson(res, 400, { error: '要 multipart/form-data，字段名 file' });
+  }
+  let buf;
+  try { buf = await readRawBody(req, 8 * 1024 * 1024, '技能包过大（上限 8MB）'); }
+  catch (e) { return sendJson(res, 413, { error: String(e.message || e) }); }
+
+  const up = await fetch(`${BASE}/skills/${skillId}/update`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': ct },
+    body: buf,
+  });
+  const text = await up.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = text; }
+  if (!up.ok) return sendJson(res, up.status, { error: body?.error?.message || body?.message || String(text).slice(0, 300) });
+  console.log(`[skills] 传包更新 ${skillId} (${buf.length}B)`);
+  return sendJson(res, 200, body || {});
+}
+
+// ---------- Agent 挂载 ----------
+// 挂载实况以平台为准（GET /agents/{id}），不以 state.json 为准。
+// 平台上的 skills 只有 ID，名字要回技能库补一次，界面上才看得懂挂了什么。
+async function agentMounted(st) {
+  const a = await api(`/agents/${st.agentId}`);
+  const mounted = Array.isArray(a?.skills) ? a.skills : [];
+  const skills = await Promise.all(mounted.map(async (s) => {
+    const id = s.skillID || s.skillId || s.id || '';
+    try {
+      const d = await api(`/skills/${id}`);
+      return { skillID: id, releaseID: s.releaseID || d.releaseId || '', name: d.name || id, version: d.version || '', builtin: !!d.builtin };
+    } catch (e) {
+      return { skillID: id, releaseID: s.releaseID || '', name: id, error: String(e.message || e) };
+    }
+  }));
+  return {
+    agentId: a?.id || st.agentId,
+    version: a?.version ?? st.agentVersion,
+    name: a?.name || '',
+    description: a?.description || '',
+    systemChars: (a?.system || '').length,
+    files: (a?.files || []).map((f) => ({
+      fileID: f.fileID,
+      // 平台不回文件名，只有 fileID，名字从 state.json 里补
+      name: f.name || f.filename || (st.files || []).find((x) => x.fileID === f.fileID)?.name || '',
+    })),
+    mcpServers: a?.mcpServers || [],
+    skills,
+  };
+}
+
+async function mountSkill(st, { skillID, releaseID, name, action }) {
+  if (!skillID) throw new Error('skillID 必填');
+  const mounted = await agentMounted(st);
+  let list = mounted.skills.map((s) => ({ skillID: s.skillID, releaseID: s.releaseID, name: s.name }));
+  if (action === 'remove') {
+    list = list.filter((s) => s.skillID !== skillID);
+  } else {
+    let label = name;
+    if (!label) {
+      try { label = (await api(`/skills/${skillID}`)).name || skillID; } catch { label = skillID; }
+    }
+    list = [...list.filter((s) => s.skillID !== skillID), { skillID, releaseID: releaseID || '', name: label }];
+  }
+  const next = await updateAgent({ ...st, agentVersion: mounted.version }, { skills: list });
+  const after = await agentMounted(next);
+  // 把内存里的「场景点名技能」跟着改掉。不改的话，下一次提问时 bootstrap 会拿
+  // scenario.json 那份去比，刚在界面上加挂的技能当场被撤掉。
+  wantedSkills = after.skills.map((s) => ({ skillID: s.skillID, releaseID: s.releaseID, name: s.name }));
+  console.log(`[agent] ${action === 'remove' ? '摘除' : '加挂'} ${skillID} → v${after.version}，现有：${after.skills.map((s) => s.name).join('/') || '(无)'}`);
+  return after;
 }
 
 // ---------- 静态资源 ----------
@@ -575,13 +893,21 @@ const server = http.createServer(async (req, res) => {
         commands: SCENARIO.commands,
         repair: SCENARIO.repair,
         scenario: SCENARIO.id,
+        // 场景里点名要挂的技能（名字）。挂载实况以 /api/agent 为准，这里是配置意图
+        agent: {
+          name: SCENARIO.agent.name,
+          description: SCENARIO.agent.description,
+          skills: SCENARIO.agent.skills || [],
+          systemChars: SCENARIO.agent.system.length,
+          systemLimit: 1000,
+        },
         // 没配 ASR Key 时前端直接把麦克风置灰，不要让人按下去才看到报错
         voice: { enabled: !!ASR_KEY },
       });
     }
     if (p === '/api/bootstrap') {
       const st = await bootstrap({ force: url.searchParams.get('force') === '1' });
-      return sendJson(res, 200, { agentId: st.agentId, version: st.agentVersion, files: st.files });
+      return sendJson(res, 200, { agentId: st.agentId, version: st.agentVersion, files: st.files, skills: st.skills || [] });
     }
     if (p === '/api/ask' && req.method === 'POST') return await handleAsk(req, res);
     if (p === '/api/asr' && req.method === 'POST') return await handleAsr(req, res);
@@ -601,30 +927,103 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { data: items, cards: journal.bySession(mHist[1]) });
     }
 
-    // 设备面板：契约字段走真实接口，运行态走 demo 补充接口
+    // 设备面板：全部字段走真实接口，room 与品类名是本地补的显示字段
+    // 曾经还并一路 demo 补充接口取开关态，列已删，那一路也撤了——真实网关没有这个接口，
+    // 留着就是每次开面板都往客户平台发一个必然 404 的请求
     if (p === '/api/iot/devices') {
       const list = await iot.deviceList(SCENARIO.iot.homeId);
-      const live = await iot.demoState();
-      const liveMap = new Map((live.response?.data || []).map((d) => [d.deviceName, d]));
       const rows = (list.response?.data || []).map((d) => {
         const fix = DEVICES.devices.find((x) => x.deviceName === d.deviceName) || {};
         return {
           ...d,
           room: fix.room || '', categoryName: CATEGORY_NAME[d.categoryCode] || d.categoryCode,
-          power: liveMap.get(d.deviceName)?.power ?? null,
-          status: liveMap.get(d.deviceName)?.status ?? null,
         };
       });
       return sendJson(res, 200, { data: rows, ok: list.ok, error: list.error || null, ms: list.ms });
     }
+    // 场景列表没有对应的平台接口（文档里只有 POST /scene，没有查询），所以这一屏
+    // 列的是本编排层自己建过的场景，从审计流水里取。真实平台建完场景后返回什么结构
+    // 我们没有样本，所以这里只回我们确定发出去的那几个字段，不假装知道平台的回执。
     if (p === '/api/iot/scenes') {
-      const r = await iot.sceneList();
-      return sendJson(res, 200, { data: r.response?.data || [], ok: r.ok, error: r.error || null });
+      const rows = audit.tail(500)
+        .filter((e) => e.kind === 'scene.create' && e.result === 'SUCCEEDED')
+        .map((e) => {
+          // 新记录带 scene 分列。早于这次改动的记录只有 targets（条件与动作混在一起），
+          // 但条件才带 time 字段、动作从不带，所以按有没有 time 拆就是准的。
+          const cond = e.scene?.conditionList ?? (e.targets || []).filter((t) => t.time);
+          const act = e.scene?.actionList ?? (e.targets || []).filter((t) => !t.time);
+          return {
+            sceneId: e.iotResponse?.data?.sceneId || `本地记录 ${String(e.at || '').slice(11, 19)}`,
+            trigger: cond.some((c) => c.time) ? 'schedule' : 'manual',
+            conditionList: cond,
+            actionList: act,
+            at: e.at,
+          };
+        });
+      return sendJson(res, 200, { data: rows, ok: true, error: null });
     }
 
     if (p === '/api/audit') {
       const limit = Number(url.searchParams.get('limit') || 100);
       return sendJson(res, 200, { data: audit.tail(limit) });
+    }
+
+    // ---- 技能管理 ----
+    if (p === '/api/skills' && req.method === 'GET') {
+      const page = url.searchParams.get('page') || '1';
+      const pageSize = url.searchParams.get('pageSize') || '20';
+      const keyword = url.searchParams.get('keyword') || '';
+      // page / pageSize 都是必填，平台不给默认值；搜索参数名是 keyword，
+      // name / search 会被静默忽略（total 不动），别写错
+      const qs = new URLSearchParams({ page, pageSize });
+      if (keyword) qs.set('keyword', keyword);
+      const r = await api(`/skills?${qs}`);
+      return sendJson(res, 200, { data: r?.data || [], total: r?.total ?? (r?.data || []).length, page: Number(page), pageSize: Number(pageSize) });
+    }
+    // 新建。没有 :id，走的是同一段处理，handleSkillWrite 按 skillId 有没有来分新建 / 换源
+    if (p === '/api/skills' && req.method === 'POST') return await handleSkillWrite(req, res, '');
+    // zip 要排在 /api/skills/:id 前面，否则会被那条吃掉
+    const mZip = p.match(/^\/api\/skills\/([^/]+)\/zip$/);
+    if (mZip && req.method === 'POST') return await handleSkillZip(req, res, mZip[1]);
+    const mSkill = p.match(/^\/api\/skills\/([^/]+)$/);
+    if (mSkill && req.method === 'GET') return sendJson(res, 200, await api(`/skills/${mSkill[1]}`));
+    if (mSkill && req.method === 'POST') return await handleSkillWrite(req, res, mSkill[1]);
+    if (mSkill && req.method === 'DELETE') {
+      const r = await api(`/skills/${mSkill[1]}`, { method: 'DELETE' });
+      console.log(`[skills] 删除 ${mSkill[1]}`);
+      wantedSkills = null; // 缓存里可能还留着刚删掉的那个
+      return sendJson(res, 200, r || {});
+    }
+
+    // ---- Agent 挂载 ----
+    if (p === '/api/agent') {
+      const st = readState();
+      if (!st.agentId) return sendJson(res, 400, { error: '还没 bootstrap，先 GET /api/bootstrap' });
+      return sendJson(res, 200, await agentMounted(st));
+    }
+    if (p === '/api/agent/skills' && req.method === 'POST') {
+      const st = readState();
+      if (!st.agentId) return sendJson(res, 400, { error: '还没 bootstrap' });
+      return sendJson(res, 200, await mountSkill(st, await readBody(req)));
+    }
+
+    // ---- 生成物 ----
+    if (p === '/api/artifacts') {
+      const limit = Number(url.searchParams.get('limit') || 100);
+      return sendJson(res, 200, { data: await listArtifacts(limit), scanned: ARTIFACT_SCAN });
+    }
+    if (p === '/api/artifacts/resolve') {
+      const sid = url.searchParams.get('sessionId');
+      const abs = url.searchParams.get('path');
+      if (!sid || !abs) return sendJson(res, 400, { error: 'sessionId 和 path 都要给' });
+      // path-map 的返回体是以路径为键的 map（传 path 时只有一个键），不是对象本身
+      const map = await artifactMap(sid);
+      const info = map[abs] || Object.values(map).find((v) => v.path === abs || v.filename === path.basename(abs)) || {};
+      return sendJson(res, 200, {
+        downloadUrl: info.downloadUrl || '', previewUrl: info.previewUrl || '', pdfUrl: info.pdfUrl || '',
+        previewMode: info.previewMode || '', filename: info.filename || '', mimeType: info.mimeType || '',
+        fileType: info.fileType || '', size: info.size ?? null,
+      });
     }
 
     if (p.startsWith('/api/')) return sendJson(res, 404, { error: 'no such api' });
@@ -646,7 +1045,11 @@ if (IOT_MODE === 'mock') {
   console.log(`  IoT 网关（真实）  ${ENV.IOT_BASE_URL}   设备清单=${FIXTURE_NAME}`);
 }
 if (IOT_MODE === 'real' && FIXTURE_NAME === 'demo') {
-  console.log('  提示：走真实网关但用的是演示清单，闸门认得的设备可能网关不认得。联调请加 IOT_FIXTURE=real。');
+  console.log('  提示：真实网关 + 演示清单。演示清单把主卫 5 台标成在线，闸门会放行，请求真发到箭牌；');
+  console.log('        但真实环境这 11 台全离线，平台会回「设备离线」。设备页的在线态取自真实接口，和闸门判定不一致。');
+}
+if (IOT_MODE === 'real' && FIXTURE_NAME === 'real') {
+  console.log('  提示：真实网关 + 真实清单。11 台全离线，闸门会在下发前就拦掉，请求到不了箭牌。');
 }
 
 server.listen(PORT, () => {

@@ -377,6 +377,8 @@ table.grid tr:hover td{background:var(--soft)}
 .pill{
   display:inline-block; font-family:var(--mono); font-size:10.5px; padding:1px 7px; border-radius:9999px;
   background:var(--card); color:var(--muted); border:1px solid var(--hairline);
+  /* createBy 里带连字符（internal-task），不给 nowrap 会在窄列里断成两行 */
+  white-space:nowrap;
 }
 .pill.on{background:#5db8721f; color:#3f8a52; border-color:#5db87240}
 .lvl{display:inline-block; font-family:var(--mono); font-size:10.5px; padding:1px 7px; border-radius:5px; color:#fff}
@@ -385,6 +387,41 @@ table.grid tr:hover td{background:var(--soft)}
 .lvl.H{background:var(--warn)}
 .lvl.C{background:var(--err)}
 .lvl.X{background:var(--dim)}
+
+/* ---------- 技能管理 / 产物中心 ---------- */
+/* 两页共用的小件：一行输入 + 按钮、一组行内动作、名字下面挂一行等宽小字 */
+.rowline{display:flex; gap:8px; align-items:center; margin:10px 0}
+.rowline .find{flex:1 1 auto; width:auto; margin-bottom:0}
+.rowacts{display:flex; gap:6px; align-items:center; flex-wrap:wrap}
+/* 表格里的操作列：三个按钮必须横着排，不然窄列里会摞成三行。
+   类名别叫 acts——那已经被执行过程面板占了（深色底），撞上会整格变黑。 */
+table.grid td.acts-cell{white-space:nowrap}
+table.grid td.acts-cell .rowacts{flex-wrap:nowrap}
+a.mini{display:inline-block; text-decoration:none; line-height:1.5}
+.sn{font-weight:500; color:var(--ink)}
+.sid{font-family:var(--mono); font-size:10.5px; color:var(--dim); margin-top:3px; word-break:break-all}
+.hint.err{color:var(--err)}
+input.filein{
+  flex:1 1 auto; min-width:0; font:inherit; font-size:12px; color:var(--muted);
+  background:var(--canvas); border:1px solid var(--hairline); border-radius:8px; padding:5px 8px;
+}
+input.filein::file-selector-button{
+  font:inherit; font-size:11.5px; cursor:pointer; margin-right:9px; padding:2px 9px;
+  border:1px solid var(--hairline); border-radius:6px; background:var(--soft); color:var(--body);
+}
+/* 展开的更新行：贴在它所属的那一行下面，缩进一格表示从属关系 */
+table.grid tr.sub td{background:var(--soft); padding:10px 12px 12px 22px}
+table.grid tr.sub .hint{padding:4px 0 0}
+/* 挂载那几行右侧要放按钮，值这一栏得把剩余宽度吃掉 */
+.kv .v{flex:1}
+
+/* 产物卡：交付物是这一轮的落点，单独给一张卡，不混进工具行 */
+.artifact{margin:14px 0; border:1px solid var(--hairline); border-radius:var(--r); background:var(--canvas); padding:12px 14px}
+.artifact-h{display:flex; align-items:center; gap:9px}
+.artifact-h .ico{color:var(--accent); font-size:13px; flex:none}
+.artifact-h .fn{font-family:var(--mono); font-size:12.5px; color:var(--ink); min-width:0; word-break:break-all}
+.artifact-h .act{margin-left:auto; flex:none}
+.artifact-m{font-family:var(--mono); font-size:10.5px; color:var(--dim); margin-top:6px; word-break:break-all}
 
 @media (max-width:820px){
   .app{grid-template-columns:1fr}
