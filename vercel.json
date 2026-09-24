@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "regions": ["sin1"],
+  "regions": ["icn1"],
   "outputDirectory": "public",
   "functions": {
     "api/**/*.mjs": {
