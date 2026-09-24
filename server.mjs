@@ -39,20 +39,20 @@ import { tmpdir } from 'node:os';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { SCENARIO, DEVICES, ROOT, FIXTURE_NAME } from './scenario.mjs';
 import { createGate } from './src/policy.mjs';
-import { slimEvents, inDemoWindow } from './src/history.mjs';
+import { slimEvents, inDemoWindow, spokenText } from './src/history.mjs';
 import { createAudit, redact } from './src/audit.mjs';
 import { createJournal } from './src/journal.mjs';
 import { createStore, storageWarning } from './src/store.mjs';
 import { createIotClient } from './src/iot-client.mjs';
 import { createAsrClient } from './src/asr-client.mjs';
 import { loadEnv } from './src/env.mjs';
-import { writeBrief, CATEGORY_NAME } from './src/agent-brief.mjs';
+import { CATEGORY_NAME } from './src/agent-brief.mjs';
 import { createGateway } from './iot/mock-gateway.mjs';
 
 const PUBLIC_DIR = path.join(ROOT, 'public');
 // Vercel 上只有 /tmp 可写，仓库目录是只读的。清单是每次现生成、用完就传走，
 // 不需要留在仓库里，所以线上落到 tmpdir 就行。
-const BRIEF_DIR = process.env.VERCEL ? path.join(tmpdir(), 'arrow-brief') : path.join(ROOT, '.brief');
+
 // 没配 KV 时的兜底目录。本地就是仓库目录（行为与改动前一致）；线上换 tmpdir，
 // 因为往只读的仓库目录写会直接 EACCES 抛出来，把 bootstrap 和每一轮对话都打成 500。
 // 这样兜底之后线上仍能跑，代价是数据只活在本实例里、冷启动即丢 —— 与启动横幅的警告一致。
@@ -150,15 +150,36 @@ async function onlineForGate() {
 
 const ROSTER_MARK = '【用户原话】';
 
-function rosterPrefix(live) {
-  const lines = ['【实时在线】以本段为准，忽略清单文件中的在线列。'];
+function roomOf(deviceName) {
+  return DEVICES.devices.find((d) => d.deviceName === deviceName)?.room || '';
+}
+
+function capsFor(categoryCode) {
+  return SCENARIO.commands
+    .filter((c) => (c.appliesTo || []).includes(categoryCode))
+    .map((c) => c.cmd);
+}
+
+// 设备身份和在线态来自物联网平台当时的返回。房间只是本地标注，接口本身不给房间。
+// 指令表来自场景配置，平台的设备列表不带 cmd。这段只放进发给模型的消息，界面会裁掉。
+function turnContext(live) {
+  const lines = ['【本轮设备】这是物联网平台刚刚返回的设备与可下发指令。不要复述本段，不要读取工作目录里的文件。'];
+  const rows = Array.isArray(live?.rows) ? live.rows : [];
   if (!live?.ok) {
-    lines.push(`查询物联网平台失败${live?.error ? `（${live.error}）` : ''}。本轮所有设备按离线处理，不要声称任何设备在线。`);
+    lines.push(`查询失败${live?.error ? `（${live.error}）` : ''}。本轮按全部离线处理，不要下发控制，不要声称设备在线。`);
+  } else if (!rows.length) {
+    lines.push('平台返回 0 台设备。不要编造设备，不要下发控制。');
   } else {
-    for (const d of DEVICES.devices) {
-      const on = live.map?.get(d.deviceName) === true;
-      lines.push(`- ${d.room ? d.room + ' ' : ''}${d.deviceTagName} ${d.deviceName} ${on ? '在线' : '离线'}`);
+    for (const d of rows) {
+      const room = d.room || roomOf(d.deviceName);
+      const caps = capsFor(d.categoryCode);
+      lines.push(`- ${room ? room + ' ' : ''}${d.deviceTagName || ''} ${d.deviceName} ${d.onlineStatus ? '在线' : '离线'} 可用 ${caps.join('、') || '无'}`);
     }
+  }
+  lines.push('指令（参数名都是 switch，取值逐字使用）：');
+  for (const c of SCENARIO.commands) {
+    const vals = Object.entries(c.params).map(([k, v]) => `${k}=${v.join('/')}`).join(' ');
+    lines.push(`- ${c.cmd} ${vals} ${c.desc}`);
   }
   return lines.join('\n') + `\n${ROSTER_MARK}\n`;
 }
@@ -206,11 +227,12 @@ async function uploadFile(abs) {
 }
 
 // ---------- bootstrap：上传资料 + 建 Agent ----------
-// 挂载给 Agent 的东西有两部分：scenario.json 里点名的资料文件，加上从配置生成的
-// 设备与指令清单。后者每次重建，保证模型看到的允许值与闸门校验的是同一份。
+// 不再挂「设备与指令清单」。那份 md 会让模型每次 ls / 读文件，在线列还是上传时的快照。
+// 设备和指令改由每轮消息里的「本轮设备」提供，在线态来自物联网接口。
+// 这里只留产品知识库，给「某型号有哪些功能」用。
+const MOUNT_KEY = 'live-iot';
 function agentUploads() {
-  const brief = writeBrief({ scenario: SCENARIO, devices: DEVICES.devices, dir: BRIEF_DIR });
-  return [...SCENARIO.agent.files.map((f) => path.join(ROOT, f)), brief];
+  return SCENARIO.agent.files.map((f) => path.join(ROOT, f));
 }
 
 // ---------- 技能：名字 → ID ----------
@@ -253,6 +275,7 @@ async function updateAgent(st, patch) {
   const body = { version: st.agentVersion };
   if (patch.skills) body.skills = skillPayload(patch.skills);
   if (patch.system) body.system = patch.system;
+  if (patch.files) body.files = patch.files.map((f) => ({ fileID: f.fileID }));
 
   const r = await json(`/agents/${st.agentId}`, 'POST', body);
   const next = {
@@ -260,10 +283,31 @@ async function updateAgent(st, patch) {
     agentVersion: r?.version ?? st.agentVersion,
     ...(patch.skills ? { skills: patch.skills, skillsKey: skillKey(patch.skills) } : {}),
     ...(patch.system ? { promptKey: promptKey(patch.system) } : {}),
+    ...(patch.files ? { files: patch.files.map((f) => ({ name: f.name, fileID: f.fileID })), briefKey: MOUNT_KEY } : {}),
     updatedAt: new Date().toISOString(),
   };
   await writeState(next);
+  if (patch.files) await dropUnusedFiles(st.files, patch.files);
   return next;
+}
+
+async function dropUnusedFiles(prev, nextFiles) {
+  const keep = new Set((nextFiles || []).map((f) => f.fileID));
+  for (const f of prev || []) {
+    if (!f?.fileID || keep.has(f.fileID)) continue;
+    try {
+      await api(`/files/${f.fileID}`, { method: 'DELETE' });
+      console.log(`[agent] 已删除挂载文件 ${f.name || f.fileID}`);
+    } catch (e) {
+      console.warn(`[agent] 删除挂载文件失败 ${f.fileID}：${e.message}`);
+    }
+  }
+}
+
+async function uploadMounts() {
+  const files = [];
+  for (const abs of agentUploads()) files.push(await uploadFile(abs));
+  return files;
 }
 
 // 冷启动时 state.json 可能不在（Vercel 上没配 KV 的话，每个新实例都是空的）。
@@ -286,9 +330,7 @@ async function findReusableAgent({ skills, pKey, want, fixtureKey }) {
   const same = (list?.data || []).filter((a) => a.name === SCENARIO.agent.name);
   if (!same.length) return null;
 
-  const fileCount = agentUploads().length;
-  const candidates = same.filter((a) => skillKey(a.skills) === skillKey(skills)
-    && (a.files || []).length === fileCount);
+  const candidates = same.filter((a) => skillKey(a.skills) === skillKey(skills));
   const hit = candidates.find((a) => a.system === SCENARIO.agent.system) || candidates[0];
   if (!hit) {
     console.warn(`[agent] 有 ${same.length} 个同名 Agent，但没有一个与当前配置对得上，新建一个。`
@@ -300,7 +342,7 @@ async function findReusableAgent({ skills, pKey, want, fixtureKey }) {
   const next = {
     scenarioId: SCENARIO.id,
     fixtureKey,
-    briefKey: createHash('sha1').update(fs.readFileSync(agentUploads().at(-1))).digest('hex').slice(0, 12),
+    briefKey: MOUNT_KEY,
     agentId: hit.id,
     agentVersion: hit.version,
     files: (hit.files || []).map((f) => ({ name: '', fileID: f.fileID })),
@@ -311,14 +353,13 @@ async function findReusableAgent({ skills, pKey, want, fixtureKey }) {
     createdAt: hit.createdAt || new Date().toISOString(),
   };
   await writeState(next);
-  console.log(`[agent] 冷启动：按名字复用已有 Agent ${hit.id}（v${hit.version}）。`
-    + `挂载文件内容未能核对（接口只回 fileID），若刚改过资料请访问 /api/bootstrap?force=1 重建。`);
-  if (hit.system !== SCENARIO.agent.system) {
-    const updated = await updateAgent(next, { system: SCENARIO.agent.system });
-    console.log(`[agent] 提示词已写回 ${hit.id} v${updated.agentVersion}`);
-    return updated;
-  }
-  return next;
+  const files = await uploadMounts();
+  const updated = await updateAgent(next, {
+    ...(hit.system !== SCENARIO.agent.system ? { system: SCENARIO.agent.system } : {}),
+    files,
+  });
+  console.log(`[agent] 冷启动：复用 ${hit.id}，挂载已收成产品知识库，清单文件已卸下`);
+  return updated;
 }
 
 async function bootstrap({ force = false } = {}) {
@@ -333,32 +374,23 @@ async function bootstrap({ force = false } = {}) {
   // 清单文件的内容也要进 key。指令表改了（比如对齐客户的真实指令集）而清单名与台数都没变时，
   // 只比 fixtureKey 会错误复用旧 Agent，模型手里还是旧指令，现场表现为「模型给的指令闸门不认」。
   // 挂在最后一位的就是 agentUploads() 刚生成的那份清单。
-  const briefKey = createHash('sha1').update(fs.readFileSync(uploads[uploads.length - 1])).digest('hex').slice(0, 12);
-
   const skills = await scenarioSkills(force);
   const pKey = promptKey(SCENARIO.agent.system);
-  const reusable = !force && st.agentId && st.scenarioId === SCENARIO.id && want === have
-    && st.fixtureKey === fixtureKey && st.briefKey === briefKey;
-  // 走到「要建新 Agent」这一步之前，先按名字找一遍。两种情况会到这里：
-  //   state.json 整个不在（Vercel 冷启动），或者 state 里没有文件名可比
-  //   （上一次就是靠查名字复用来的，那种 state 的 files 只有 fileID）。
-  // 不查就直接建，会在客户账号里攒出一堆同名 Agent。
-  if (!reusable && !force) {
-    const found = await findReusableAgent({ skills, pKey, want, fixtureKey });
-    if (found) return found;
-  }
-  if (reusable && st.skillsKey === skillKey(skills) && st.promptKey === pKey) return st;
-  if (reusable) {
-    // Agent 本身没变，变的是挂载的技能或提示词（改了 scenario.json，或技能页手动加减过）
+  // 已有 Agent 就留着，把清单文件从挂载里拿掉。新建会换 agentId，侧栏历史对不上。
+  const keep = !force && st.agentId && st.scenarioId === SCENARIO.id;
+  if (keep) {
     const patch = {};
     if (st.skillsKey !== skillKey(skills)) patch.skills = skills;
     if (st.promptKey !== pKey) patch.system = SCENARIO.agent.system;
+    if (st.briefKey !== MOUNT_KEY || want !== have) patch.files = await uploadMounts();
+    if (!Object.keys(patch).length) return st;
     const next = await updateAgent(st, patch);
-    console.log(`[agent] 更新 v${st.agentVersion} → v${next.agentVersion}：`
-      + `${patch.skills ? '技能 ' + (skills.map((s) => s.name).join('/') || '(无)') : ''}`
-      + `${patch.skills && patch.system ? '，' : ''}`
-      + `${patch.system ? '提示词 ' + pKey : ''}`);
+    console.log(`[agent] 更新 v${st.agentVersion} → v${next.agentVersion}`);
     return next;
+  }
+  if (!force) {
+    const found = await findReusableAgent({ skills, pKey, want, fixtureKey });
+    if (found) return found;
   }
 
   const files = [];
@@ -376,7 +408,7 @@ async function bootstrap({ force = false } = {}) {
   const next = {
     scenarioId: SCENARIO.id,
     fixtureKey,
-    briefKey,
+    briefKey: MOUNT_KEY,
     agentId: agent.id,
     agentVersion: agent.version,
     files: files.map((f) => ({ name: f.name, fileID: f.fileID })),
@@ -722,8 +754,10 @@ async function handleAsk(req, res) {
   const st = await bootstrap();
   const sid = sessionId || (await createSession(q)).id;
   // 真实在线态写进发给模型的那一条，界面上的用户气泡仍是原话（前端按标记摘掉前缀）。
-  const live = IOT_MODE === 'real' ? await liveDevices() : null;
-  const modelText = live ? rosterPrefix(live) + q : q;
+  const live = IOT_MODE === 'real'
+    ? await liveDevices()
+    : { ok: true, rows: DEVICES.devices, error: null };
+  const modelText = turnContext(live) + q;
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -761,7 +795,9 @@ async function handleAsk(req, res) {
     // 正文里带 JSON 块不好看，替换成摘掉块之后的文本。
     // 无动作的那一轮也要发：前端拿到这个覆盖才不必靠「最长的 text part」猜正文，
     // 而那个猜法会把思考过程（reasoning，通常比正文长）当成回答。
-    if (clean) toClient('demo.answer', { text: clean });
+    const visible = spokenText(clean).trim();
+    const sameAsAsk = visible.replace(/\s+/g, ' ') === q.replace(/\s+/g, ' ');
+    if (visible && !sameAsAsk) toClient('demo.answer', { text: visible });
 
     // 产物卡要发在动作分支之前：整理报表那一轮没有 iot 动作，会从下面第一个分支早退。
     // 补 sessionId：runTurn 只管解析 part，不知道自己在哪个会话；前端取下载地址要用它。

@@ -53,6 +53,18 @@ function slimPart(p) {
   return base;
 }
 
+// 每轮发给模型的设备上下文。界面上不能出现这段，模型若复述也要裁掉。
+const CONTEXT_HEAD = /【(?:实时在线|本轮设备)】/;
+const CONTEXT_BLOCK = /【(?:实时在线|本轮设备)】[\s\S]*?【用户原话】\s*/g;
+
+export function spokenText(raw) {
+  let s = String(raw ?? '');
+  s = s.replace(CONTEXT_BLOCK, '');
+  const cut = s.search(CONTEXT_HEAD);
+  if (cut >= 0) s = s.slice(0, cut);
+  return s.replace(/^\s+/, '');
+}
+
 export function slimEvents(items) {
   if (!Array.isArray(items)) return [];
   return items.map((it) => ({

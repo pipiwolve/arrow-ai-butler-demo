@@ -22,7 +22,7 @@ const cwrapEl = $('#cwrap');
 const barsEl = $('#bars');
 const lmsgEl = $('#lmsg');
 
-const T = { sid: null, turn: null, ctl: null, busy: false, follow: null };
+const T = { sid: null, scene: null, turn: null, ctl: null, busy: false, follow: null };
 let CFG = {};
 
 /* ================= 小工具 ================= */
@@ -34,11 +34,13 @@ const relPath = (s) => String(s ?? '')
   .replace(/^ses_[A-Za-z0-9]+\//, '')
   .replace(/\/{2,}/g, '/');
 const flat = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
-// 服务端把实时在线态写在用户消息前面，界面只留原话。
+// 与 src/history.mjs 的 spokenText 一致。设备上下文只给模型看，回放里整段拿掉。
 const spokenText = (s) => {
-  const raw = String(s ?? '');
-  const i = raw.lastIndexOf('【用户原话】');
-  return i < 0 ? raw : raw.slice(i + '【用户原话】'.length).replace(/^\s+/, '');
+  let raw = String(s ?? '');
+  raw = raw.replace(/【(?:实时在线|本轮设备)】[\s\S]*?【用户原话】\s*/g, '');
+  const cut = raw.search(/【(?:实时在线|本轮设备)】/);
+  if (cut >= 0) raw = raw.slice(0, cut);
+  return raw.replace(/^\s+/, '');
 };
 const clip = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + '…' : String(s));
 const plain = (s) => flat(s).replace(/\*\*|__|`|~~/g, '').replace(/^\||\|$/g, '');
@@ -378,7 +380,7 @@ function paintActs(t, aid) {
 const LEVEL_NAME = { L: '低危', M: '中危', H: '高危', C: '严重', X: '校验未过' };
 const DEC_NAME = { allow: '放行', confirm: '待确认', deny: '拦截' };
 
-function addGateCard(t, g, replay) {
+function addGateCard(t, g, replay, onDecide) {
   const card = el('div', 'gate lv-' + g.level);
   const h = el('div', 'gate-h');
   h.append(el('span', 'lv', `${g.level} ${LEVEL_NAME[g.level] || ''}`));
@@ -392,7 +394,22 @@ function addGateCard(t, g, replay) {
   b.append(ul);
 
   if (g.decision === 'confirm') {
-    if (replay) {
+    if (onDecide) {
+      const pend = el('div', 'gate-act');
+      const yes = el('button', null, '确认执行');
+      const no = el('button', 'ghost', '取消');
+      yes.type = 'button'; no.type = 'button';
+      pend.append(yes, no);
+      const finish = (decision) => {
+        yes.disabled = true; no.disabled = true;
+        settleGateCard(t, card, '预留', decision, null);
+        onDecide(decision, t);
+      };
+      yes.onclick = () => finish('approve');
+      no.onclick = () => finish('reject');
+      b.append(pend);
+      b.append(el('div', 'pend', '预留确认 · 点了也不会向网关下发'));
+    } else if (replay) {
       // 回放不给按钮：pendingId 只有 5 分钟有效，现在点也只会报「已失效」。
       // 当时真点过的话 /api/confirm 落了 resolve，settleGateCard 会把它改成终态。
       b.append(el('div', 'pend', `待确认编号 ${g.pendingId} · 已失效`));
@@ -410,6 +427,8 @@ function addGateCard(t, g, replay) {
     }
   } else if (g.decision === 'deny') {
     b.append(el('div', 'pend', '本次不上发任何指令到 IoT 网关，事件已记入安全审计'));
+  } else if (g.preview) {
+    b.append(el('div', 'pend', '预留放行 · 下面是将要发出的报文，这次没有请求网关'));
   } else {
     b.append(el('div', 'pend', '闸门放行，已下发到 IoT 网关'));
   }
@@ -869,6 +888,11 @@ function handleEvent(ev, d, t) {
 }
 
 async function ask(text) {
+  if (T.scene) {
+    T.scene = null;
+    streamEl.innerHTML = '';
+    wrap = null;
+  }
   if (T.ctl) { T.ctl.abort(); T.ctl = null; }
   stopFollow();
   if (!wrap) ensureWrap();
@@ -928,6 +952,7 @@ async function openSession(sid, title) {
   T.busy = false;
   sendBtn.disabled = false;
   T.sid = sid;
+  T.scene = null;
   chatTitle.textContent = clip(title || '对话', 40);
   setStatus('', '已载入');
 
@@ -981,12 +1006,15 @@ async function renderHistory(sid) {
   // 一个回合在历史里是连着的好几条 assistant 消息，必须并成一个气泡
   const turns = [];
   let turn = null;
+  let lastUser = '';
   for (const it of items) {
     const role = it?.info?.role;
     const parts = it?.parts || [];
     if (role === 'user') {
       const txt = parts.filter((p) => p.type === 'text').map((p) => p.text).filter(Boolean).join('\n');
-      if (txt) addUser(spokenText(txt));
+      const shown = spokenText(txt);
+      if (shown) addUser(shown);
+      lastUser = flat(shown);
       turn = null;
       continue;
     }
@@ -996,6 +1024,7 @@ async function renderHistory(sid) {
     const tm = it?.info?.time || {};
     if (!turn) {
       turn = newTurn(false);
+      turn.userText = lastUser;
       addTurn(turn);
       turns.push(turn);
       turn.startedAt = tm.created || Date.now();
@@ -1045,6 +1074,241 @@ function replayCards(turns, recs) {
   }
 }
 
+/* ================= 需求场景（侧栏可点开的预留回放） ================= */
+
+const HOME = () => CFG.iot?.homeId ?? 933;
+const TUB = { deviceName: 'ARROW0417663939524510', deviceTagName: 'ACH102智能浴缸', room: '主卫' };
+const TOILETS = [
+  { deviceName: 'ARROWToilet17419421020631', deviceTagName: 'AKB1332-P智能坐便器', room: '主卫' },
+  { deviceName: 'ARROW0117701862667130', deviceTagName: 'AKB1357智能坐便器', room: '主卫' },
+];
+const MIRRORS = [
+  { deviceName: 'ARROW0617696743520408', deviceTagName: 'QN-PRO智能镜柜', room: '主卫' },
+  { deviceName: 'ARROW0617696743520409', deviceTagName: 'QN-PRO智能镜柜', room: '主卫' },
+];
+const SCENE_AT = '2026-09-24 22:00:00';
+
+function addReserveCard(t, d) {
+  const card = el('div', 'reserve');
+  const h = el('div', 'reserve-h');
+  h.append(el('b', null, d.title));
+  if (d.badge) h.append(el('span', 'pill', d.badge));
+  card.append(h);
+  if (d.note) card.append(el('p', null, d.note));
+  for (const row of d.rows || []) {
+    const line = el('div', 'kv');
+    line.append(el('span', 'k', row.k), el('span', 'v' + (row.mono ? ' mono' : ''), row.v));
+    card.append(line);
+  }
+  if (d.payload) card.append(el('pre', 'raw', d.payload));
+  t.cardsEl.append(card);
+  scrollBottom();
+}
+
+function addPickCard(t, d) {
+  const card = el('div', 'reserve');
+  const h = el('div', 'reserve-h');
+  h.append(el('b', null, d.title));
+  h.append(el('span', 'pill', '预留'));
+  card.append(h);
+  if (d.note) card.append(el('p', null, d.note));
+  const picks = el('div', 'picks');
+  for (const opt of d.options) {
+    const b = el('button', null, opt.label);
+    b.type = 'button';
+    b.onclick = () => {
+      for (const x of picks.querySelectorAll('button')) x.disabled = true;
+      b.classList.add('on');
+      d.onPick(opt, t);
+    };
+    picks.append(b);
+  }
+  card.append(picks);
+  t.cardsEl.append(card);
+  scrollBottom();
+}
+
+function controlBody(dev, cmd, value) {
+  return {
+    homeId: HOME(),
+    cmdList: [{ deviceName: dev.deviceName, cmd, param: 'switch', value }],
+  };
+}
+
+function showControl(t, dev, cmd, value) {
+  addReserveCard(t, {
+    title: '下发报文',
+    badge: '预留',
+    note: '11 台设备目前都离线，真发出去平台会回「设备离线」。这里只放下发前的报文。',
+    rows: [
+      { k: '设备', v: `${dev.room} · ${dev.deviceTagName}` },
+      { k: '指令', v: `${cmd} = ${value}`, mono: true },
+      { k: '接口', v: 'POST /ext/v3/ai/control', mono: true },
+    ],
+    payload: JSON.stringify(controlBody(dev, cmd, value), null, 2),
+  });
+}
+
+function showAllowed(t, dev, cmd, value, reason) {
+  addGateCard(t, {
+    decision: 'allow', level: 'M', preview: true,
+    reasons: [reason],
+    items: [{ deviceName: dev.deviceName, deviceTagName: dev.deviceTagName, room: dev.room, cmd, param: 'switch', value }],
+  });
+  showControl(t, dev, cmd, value);
+}
+
+const SCENES = [
+  {
+    id: 'valve',
+    tag: '高危 · 二次确认',
+    title: '把主卫的浴缸进水打开',
+    answer: '主卫 ACH102 的进水阀是需求里点名的水阀开关，属于高危。模型只提出要打开，下发要等你确认。',
+    play(t) {
+      addGateCard(t, {
+        decision: 'confirm', level: 'H',
+        reasons: ['浴缸进水阀开关（需求 3.4 点名的「水阀开关」）'],
+        items: [{ ...TUB, cmd: 'switch_water_in', param: 'switch', value: 'on' }],
+      }, false, (decision, turn) => {
+        if (decision === 'approve') showControl(turn, TUB, 'switch_water_in', 'on');
+      });
+    },
+  },
+  {
+    id: 'flush',
+    tag: '设备控制 · 先确认哪一台',
+    title: '把主卫坐便器的大冲打开',
+    answer: '主卫有两台坐便器，大冲不会猜是哪一台。点一台之后，看中危指令怎样直接放行。',
+    play(t) {
+      addPickCard(t, {
+        title: '先确认是哪一台',
+        note: '两台都标在主卫：AKB1332-P 与 AKB1357。',
+        options: TOILETS.map((d) => ({ ...d, label: `${d.room} · ${d.deviceTagName.replace('智能坐便器', '')}` })),
+        onPick(dev, turn) { showAllowed(turn, dev, 'switch_watering', 'on', 'M 级操作，未达二次确认阈值，闸门放行'); },
+      });
+    },
+  },
+  {
+    id: 'light',
+    tag: '设备控制 · 镜柜夜灯',
+    title: '把主卫镜柜的夜灯打开',
+    answer: '夜灯在官方品类表里只写了马桶，实测镜柜（品类 06）也收。主卫有两台 QN-PRO，先点一台。',
+    play(t) {
+      addPickCard(t, {
+        title: '先确认是哪一台',
+        note: '两台型号相同，用设备编号区分。',
+        options: MIRRORS.map((d) => ({ ...d, label: `${d.room} · QN-PRO · ${d.deviceName.slice(-4)}` })),
+        onPick(dev, turn) { showAllowed(turn, dev, 'switch_night_light', 'on', 'M 级操作，镜柜夜灯按平台实测放行'); },
+      });
+    },
+  },
+  {
+    id: 'scene',
+    tag: '场景创建 · 高危',
+    title: '每天晚上 10 点自动给主卫浴缸放水',
+    answer: '接口只接受一个具体时刻，没有「每天」这种重复。按最近一次 2026-09-24 22:00 预留。进水阀仍是高危，场景和单次控制用同一条确认。',
+    play(t) {
+      const conditionList = [{ deviceName: TUB.deviceName, cmd: 'switch_water_in', param: 'switch', value: 'on', time: SCENE_AT }];
+      const actionList = [{ deviceName: TUB.deviceName, cmd: 'switch_water_in', param: 'switch', value: 'on' }];
+      addGateCard(t, {
+        decision: 'confirm', level: 'H',
+        reasons: ['浴缸进水阀开关（高危校验对场景与单次控制一视同仁）'],
+        items: [{ ...TUB, cmd: 'switch_water_in', param: 'switch', value: 'on' }],
+      }, false, (decision, turn) => {
+        if (decision !== 'approve') return;
+        addReserveCard(turn, {
+          title: '场景报文',
+          badge: '预留',
+          note: '平台没有场景查询接口。这张卡没有写入审计，设备页的场景列表不会因此多出一条。',
+          rows: [
+            { k: '触发', v: `${SCENE_AT} · 进水打开`, mono: true },
+            { k: '执行', v: 'switch_water_in = on', mono: true },
+            { k: '接口', v: 'POST /ext/v3/ai/scene', mono: true },
+          ],
+          payload: JSON.stringify({ homeId: HOME(), conditionList, actionList }, null, 2),
+        });
+      });
+    },
+  },
+  {
+    id: 'wiki',
+    tag: '产品百科',
+    title: 'AKB1357 有哪些功能？',
+    answer: 'AKB1357 是即热式一体坐便器，支持大冲。座温有 10 档，但真实平台没有对应的可下发指令，只能在遥控器或 App 上调。下面这份资料是演示占位，正式内容要等箭牌替换。',
+    play(t) {
+      addReserveCard(t, {
+        title: '资料',
+        badge: '预留',
+        note: '需求写明知识库由箭牌提供。当前文件只为把问答链路跑通。',
+        rows: [
+          { k: '文件', v: '箭牌产品知识库.md', mono: true },
+          { k: '型号', v: 'AKB1357 智能坐便器' },
+          { k: '可下发', v: '大冲、夜灯、翻盖、脚触、润瓷、开关' },
+          { k: '不能下发', v: '座温 10 档、暖风烘干' },
+        ],
+      });
+    },
+  },
+  {
+    id: 'repair',
+    tag: '报修引导',
+    title: '我家坐便器不出水了，要报修',
+    answer: '可以跳到 App 的报修页提交坐便器不出水的报修。进度也在报修页里查，派单和上门不在本助手里。',
+    play(t) {
+      addRepairCard(t, {
+        kind: 'report',
+        summary: '我家坐便器不出水了，要报修',
+        deeplink: 'arrowhome://repair/create?from=ai_assistant',
+        deeplinks: {
+          report: 'arrowhome://repair/create?from=ai_assistant',
+          progress: 'arrowhome://repair/list?from=ai_assistant',
+        },
+        note: CFG.repair?.note || '只做跳转，不对接工单。真实地址待箭牌 App 确认。',
+      });
+    },
+  },
+  {
+    id: 'sheet',
+    tag: '生成交付物',
+    title: '把主卫所有设备的状态整理成一份表格',
+    answer: '交付物是文件，不是对话里的一张表。挂上 xlsx 技能并真实跑一轮后，下面这张卡会换成可下载的文件。',
+    play(t) {
+      addReserveCard(t, {
+        title: '主卫设备状态.xlsx',
+        badge: '预留',
+        note: '现在没有向平台要下载地址。技能管理里能看到 xlsx 是否挂在本助手上。',
+        rows: [
+          { k: '主卫', v: 'ACH102 浴缸 · 离线' },
+          { k: '主卫', v: 'AKB1332-P 坐便器 · 离线' },
+          { k: '主卫', v: 'AKB1357 坐便器 · 离线' },
+          { k: '主卫', v: 'QN-PRO 镜柜 ×2 · 离线' },
+        ],
+      });
+    },
+  },
+];
+
+function openScene(scene) {
+  if (T.ctl) { T.ctl.abort(); T.ctl = null; }
+  stopFollow();
+  T.sid = null;
+  T.scene = scene.id;
+  T.busy = false;
+  sendBtn.disabled = false;
+  chatTitle.textContent = clip(scene.title, 40);
+  setStatus('', '场景预留');
+  streamEl.innerHTML = '';
+  wrap = null;
+  addUser(scene.title);
+  const t = newTurn(false);
+  t.override = scene.answer;
+  t.endedAt = t.startedAt;
+  addTurn(t);
+  paint(t);
+  scene.play(t);
+  paintSessions();
+}
+
 /* ================= 会话列表 ================= */
 
 let allSessions = [];
@@ -1058,10 +1322,26 @@ async function loadSessions() {
 
 function paintSessions() {
   const q = ($('#sessFind')?.value || '').trim().toLowerCase();
+  const scenes = SCENES.filter((s) => !q || (s.title + s.tag).toLowerCase().includes(q));
   const data = q ? allSessions.filter((s) => String(s.title || '').toLowerCase().includes(q)) : allSessions;
   sessionsEl.innerHTML = '';
-  if (!allSessions.length) { sessionsEl.append(el('div', 'hint', '还没有对话')); return; }
-  if (!data.length) { sessionsEl.append(el('div', 'hint', '没有匹配的会话')); return; }
+  if (scenes.length) {
+    sessionsEl.append(el('div', 'sess-k', '需求场景'));
+    for (const s of scenes) {
+      const row = el('div', 'srow' + (T.scene === s.id && !T.sid ? ' on' : ''));
+      const b = el('button', 'sitem');
+      b.type = 'button';
+      b.append(el('div', 't', s.title), el('div', 'd', s.tag));
+      b.onclick = () => { switchView('chat'); openScene(s); };
+      row.append(b);
+      sessionsEl.append(row);
+    }
+  }
+  sessionsEl.append(el('div', 'sess-k', '对话记录'));
+  if (!data.length) {
+    sessionsEl.append(el('div', 'hint', allSessions.length ? '没有匹配的会话' : '还没有真实对话'));
+    return;
+  }
   for (const s of data) {
     const row = el('div', 'srow' + (s.id === T.sid ? ' on' : ''));
     const b = el('button', 'sitem');
@@ -1108,7 +1388,7 @@ function sessionDeleteBtn(s) {
 function resetChat() {
   if (T.ctl) { T.ctl.abort(); T.ctl = null; }
   stopFollow();
-  T.sid = null; T.busy = false; T.turn = null;
+  T.sid = null; T.scene = null; T.busy = false; T.turn = null;
   sendBtn.disabled = false;
   chatTitle.textContent = '新对话';
   setStatus('', '空闲');
