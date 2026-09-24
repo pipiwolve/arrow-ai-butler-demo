@@ -56,8 +56,9 @@ export function createGate({ scenario, devices }) {
     if (!allowed.includes(String(item.value))) {
       throw new Error(`参数值非法：${item.param}=${item.value}，可选 ${allowed.join('/')}`);
     }
-    const on = online ? online.get(item.deviceName) === true : !!dev.onlineStatus;
-    if (!on) throw new Error(`设备离线，无法下发：${dev.deviceTagName}${dev.room ? `（${dev.room}）` : ''}`);
+    // 离线不在闸门拦截。请求照样发给 /ext/v3/ai/control，验收只看 HTTP 是否 200。
+    // 平台对离线设备通常在 HTTP 200 的正文里回「设备离线」，设备不会因此上线。
+    void online;
     return { ...riskOf(item), spec, device: dev };
   }
 

@@ -505,7 +505,7 @@ function addExecCard(t, out) {
   }
   if (out.iotResponse) {
     const io2 = el('div', 'io');
-    io2.append(el('div', 'lbl', '← 网关返回'));
+    io2.append(el('div', 'lbl', out.httpStatus ? `← HTTP ${out.httpStatus}` : '← 网关返回'));
     io2.append(el('pre', null, typeof out.iotResponse === 'string' ? out.iotResponse : JSON.stringify(out.iotResponse, null, 2)));
     b.append(io2);
   }

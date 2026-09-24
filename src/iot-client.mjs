@@ -41,16 +41,15 @@ export function createIotClient({ baseUrl, token, appPlatform, deviceSystemPlatf
       };
     }
 
-    // 文档：code 为 200 或 10000 才算成功，HTTP 200 也可能是业务失败。
-    // 实测业务失败返回的是 code 500，msg 是「处理失败，请稍后重试。」这种笼统文案，
-    // 不指出是哪个字段错了——所以给用户看的参数级提示只能由闸门出，不能指望网关。
-    const bizOk = parsed && (parsed.code === 200 || parsed.code === 10000) && parsed.success !== false;
+    // 本次验收以 HTTP 200 为准。离线设备常见的是 HTTP 200，正文 code 500、msg「设备离线」。
+    // 那不算接口没通，正文原样留给卡片展示。参数级错误仍由闸门在出网前拦住。
     return {
-      ok: res.ok && !!bizOk,
+      ok: res.ok,
+      httpStatus: res.status,
       ms: Date.now() - started,
       request: { method, url: url.href, headers, body },
       response: parsed ?? text.slice(0, 500),
-      error: res.ok && parsed && !bizOk ? `业务失败 code=${parsed.code} msg=${parsed.msg}` : (res.ok ? null : `HTTP ${res.status}`),
+      error: res.ok ? null : `HTTP ${res.status}`,
     };
   }
 

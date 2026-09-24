@@ -175,6 +175,7 @@ function turnContext(live) {
       const caps = capsFor(d.categoryCode);
       lines.push(`- ${room ? room + ' ' : ''}${d.deviceTagName || ''} ${d.deviceName} ${d.onlineStatus ? '在线' : '离线'} 可用 ${caps.join('、') || '无'}`);
     }
+    lines.push('用户要求控制时仍然输出 iot 动作。设备显示离线也要下发，不要因为离线拒绝输出动作。');
   }
   lines.push('指令（参数名都是 switch，取值逐字使用）：');
   for (const c of SCENARIO.commands) {
@@ -661,6 +662,7 @@ async function execute(rec, { trigger, actor = 'app-user', sessionId }) {
     iotRequest: res.request,
     iotResponse: res.response,
     result: res.ok ? 'SUCCEEDED' : 'FAILED',
+    httpStatus: res.httpStatus ?? null,
     error: res.error || null,
     ms: res.ms,
     // 平台没有场景查询接口，设备页那屏只能列我们建过的，靠这里把条件与动作分开存下来，
