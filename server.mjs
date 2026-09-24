@@ -175,7 +175,7 @@ function turnContext(live) {
       const caps = capsFor(d.categoryCode);
       lines.push(`- ${room ? room + ' ' : ''}${d.deviceTagName || ''} ${d.deviceName} ${d.onlineStatus ? '在线' : '离线'} 可用 ${caps.join('、') || '无'}`);
     }
-    lines.push('用户要求控制时仍然输出 iot 动作。设备显示离线也要下发，不要因为离线拒绝输出动作。');
+    lines.push('用户已指定唯一一台时，必须输出 iot 动作，离线也要下发。有多台命中时只反问，不要输出动作，也不要说两台都发。');
   }
   lines.push('指令（参数名都是 switch，取值逐字使用）：');
   for (const c of SCENARIO.commands) {
@@ -669,8 +669,23 @@ async function execute(rec, { trigger, actor = 'app-user', sessionId }) {
     // 不然 targets 是一锅烩，回看时分不出哪条是触发条件
     ...(isScene ? { scene: { conditionList: rec.action.conditionList || [], actionList: rec.action.actionList || [] } } : {}),
   };
+  entry.receipt = controlReceipt(entry);
   await audit.append(entry);
   return { ...entry, ok: res.ok };
+}
+
+// 模型的正文写在请求之前，不能当结果。这句用网关的 HTTP 状态和 msg 补上。
+function controlReceipt(out) {
+  const http = out.httpStatus ? `HTTP ${out.httpStatus}` : '';
+  const body = out.iotResponse && typeof out.iotResponse === 'object' ? out.iotResponse : null;
+  const msg = body?.msg || body?.message || '';
+  const accepted = body && (body.code === 200 || body.code === 10000) && body.success !== false;
+  const who = (out.targets || [])
+    .map((t) => `${t.room ? t.room + ' ' : ''}${t.deviceTagName || t.deviceName}（${t.cmd}）`)
+    .join('、');
+  if (!out.ok) return `没有发到物联网平台。${http || out.error || '请求失败'}。`;
+  if (accepted) return `已下发${who ? '：' + who : ''}。平台 ${http}，已受理。`;
+  return `已请求物联网平台${who ? '：' + who : ''}。平台 ${http}${msg ? '，返回「' + msg + '」' : ''}。指令没有在设备上执行。`;
 }
 
 // ---------- 会话 ----------
@@ -834,6 +849,10 @@ async function handleAsk(req, res) {
     if (!action) {
       const inferred = repairKindFrom(clean);
       if (inferred) await openRepair(inferred, q);
+      else if (/打开|关闭|开启|关掉|开机|关机|夜灯|大冲|进水|翻盖/.test(q)) {
+        const note = '没有向物联网平台发送指令。若有多台设备符合描述，请指定其中一台后再说一次。';
+        card('demo.note', { text: note });
+      }
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
     }

@@ -517,7 +517,17 @@ function addExecCard(t, out) {
   }
   card.append(b);
   t.cardsEl.append(card);
+  if (out.receipt) applyReceipt(t, out.receipt);
   scrollBottom();
+}
+
+// 模型正文写在请求之前。结果句以平台回执为准；原先那句「我会下发」就换掉。
+function applyReceipt(t, text) {
+  if (!text) return;
+  const prev = t.override != null ? t.override : answerText(t);
+  const noisy = /下发|已发送|都会发送|开启成功|正常下发|已经执行|已执行/.test(prev);
+  t.override = noisy ? text : [prev, text].filter(Boolean).join('\n\n');
+  paint(t);
 }
 
 function repairLinks(d) {
@@ -867,6 +877,9 @@ function handleEvent(ev, d, t) {
       loadAuditCount();
       loadDevices(true);
       break;
+    case 'demo.note':
+      applyReceipt(t, d?.text);
+      break;
     case 'demo.repair':
       addRepairCard(t, d);
       loadAuditCount();
@@ -1058,6 +1071,7 @@ function replayCards(turns, recs) {
       for (const r of rec.cards || []) {
         if (r.event === 'demo.gate') addGateCard(t, r.data, true);
         else if (r.event === 'demo.exec') addExecCard(t, r.data);
+        else if (r.event === 'demo.note') applyReceipt(t, r.data?.text);
         else if (r.event === 'demo.repair') addRepairCard(t, r.data);
         // 落盘的是没带下载地址的那份，回看时点「获取下载地址」现取。
         // sessionId 只在回合记录里有：早先写下的流水里那张卡是光秃秃的，
