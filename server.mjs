@@ -674,6 +674,37 @@ async function execute(rec, { trigger, actor = 'app-user', sessionId }) {
   return { ...entry, ok: res.ok };
 }
 
+// 模型没交出 iot 块时，不要一律说「请指定其中一台」。
+// 暖风、座温这类平台不认的功能，和主卫两台镜柜没选中，是两种回答。
+function missingCommandNote(q) {
+  const unsupported = [
+    [/暖风|烘干/, '暖风烘干'],
+    [/座温|座圈/, '座温'],
+    [/小冲/, '小冲'],
+    [/浴霸/, '浴霸'],
+    [/除雾/, '除雾'],
+    [/毛巾架/, '毛巾架'],
+  ];
+  for (const [re, name] of unsupported) {
+    if (re.test(q)) return `平台没有「${name}」这条可下发指令，只能在 App 或设备面板上操作。`;
+  }
+  if (!/打开|关闭|开启|关掉|开机|关机|夜灯|大冲|进水|翻盖|脚触|润瓷/.test(q)) return null;
+  const room = /主卫/.test(q) ? '主卫' : /客卫/.test(q) ? '客卫' : '';
+  let cats = null;
+  if (/镜柜/.test(q)) cats = new Set(['06']);
+  else if (/浴缸/.test(q)) cats = new Set(['04']);
+  else if (/马桶|坐便/.test(q)) cats = new Set(['01']);
+  else if (/夜灯/.test(q)) cats = new Set(['01', '06']);
+  else if (/大冲|翻盖|脚触|润瓷/.test(q)) cats = new Set(['01']);
+  else if (/进水/.test(q)) cats = new Set(['04']);
+  const hits = DEVICES.devices.filter((d) => (!room || d.room === room) && (!cats || cats.has(d.categoryCode)));
+  if (hits.length > 1) {
+    const names = hits.slice(0, 4).map((d) => `${d.room ? d.room + ' ' : ''}${d.deviceTagName}`).join('、');
+    return `有 ${hits.length} 台符合：${names}${hits.length > 4 ? ' 等' : ''}。请指定其中一台。本次没有向物联网平台发送指令。`;
+  }
+  return '没有形成可下发指令，物联网平台没有收到请求。';
+}
+
 // 模型的正文写在请求之前，不能当结果。这句用网关的 HTTP 状态和 msg 补上。
 function controlReceipt(out) {
   const http = out.httpStatus ? `HTTP ${out.httpStatus}` : '';
@@ -849,9 +880,9 @@ async function handleAsk(req, res) {
     if (!action) {
       const inferred = repairKindFrom(clean);
       if (inferred) await openRepair(inferred, q);
-      else if (/打开|关闭|开启|关掉|开机|关机|夜灯|大冲|进水|翻盖/.test(q)) {
-        const note = '没有向物联网平台发送指令。若有多台设备符合描述，请指定其中一台后再说一次。';
-        card('demo.note', { text: note });
+      else {
+        const note = missingCommandNote(q);
+        if (note) card('demo.note', { text: note });
       }
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
