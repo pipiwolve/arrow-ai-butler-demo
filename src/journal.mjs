@@ -32,6 +32,23 @@ export function createJournal(store) {
     await store.append(JSON.stringify(redact({ at: new Date().toISOString(), ...rec })));
   }
 
+  // 删会话时把这一路的卡片一起清掉。平台删的是会话元数据和沙箱，
+  // 闸门卡、执行卡存在本层，不删的话旧 id 再被打开仍会贴回来。
+  // 审计流水不在这里：那是已发生的设备操作，会话没了也要留。
+  async function dropSession(sessionId) {
+    if (!sessionId) return 0;
+    const kept = [];
+    let dropped = 0;
+    for (const line of await store.all()) {
+      let rec;
+      try { rec = JSON.parse(line); } catch { kept.push(line); continue; }
+      if (rec.sessionId === sessionId) { dropped += 1; continue; }
+      kept.push(line);
+    }
+    if (dropped) await store.replaceAll(kept);
+    return dropped;
+  }
+
   // 全量取再按会话筛。顺序即写入顺序，回放要靠它还原卡片先后
   async function bySession(sessionId) {
     const out = [];
@@ -43,5 +60,5 @@ export function createJournal(store) {
     return out;
   }
 
-  return { appendTurn, appendResolve, bySession };
+  return { appendTurn, appendResolve, bySession, dropSession };
 }

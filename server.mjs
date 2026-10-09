@@ -12,8 +12,9 @@
 //   POST /api/ask                   {text, sessionId?}  建会话或续问，SSE 回传
 //   POST /api/asr                   裸 PCM（16k / 单声道 / 16-bit）→ 百度短语音识别 → 文本
 //   POST /api/confirm               {pendingId, decision} 高危动作的二次确认
-//   GET  /api/sessions              本场景的会话列表
-//   GET  /api/sessions/:id/events   某会话的完整消息历史
+//   GET    /api/sessions              本场景的会话列表
+//   DELETE /api/sessions/:id        删除会话（平台元数据与沙箱）并清掉本层卡片
+//   GET    /api/sessions/:id/events 某会话的完整消息历史
 //   GET  /api/iot/devices           家庭设备（走 IoT 网关真实接口）
 //   GET  /api/iot/scenes            已创建场景
 //   GET  /api/audit                 审计日志
@@ -1252,12 +1253,21 @@ export async function handler(req, res) {
         data: list.map((s) => ({ id: s.id, title: s.metadata?.title || '(未命名)', status: s.status, createdAt: s.createdAt, updatedAt: s.updatedAt })),
       });
     }
-    // 公开文档没写删除，但 DELETE /sessions/{id} 对不存在的 id 回的是 session not found，
-    // 不是 405。侧栏的删除按钮走这一条，平台上的会话会真正去掉。
+    // 文档：DELETE /sessions/{session_id}，删除会话元数据及对应沙箱，成功体是 { success: true }。
+    // 卡片流水是本层自己的，平台删不到，这里按 sessionId 清掉。审计留着。
     const mDel = p.match(/^\/api\/sessions\/([^/]+)$/);
     if (mDel && req.method === 'DELETE') {
-      await api(`/sessions/${mDel[1]}`, { method: 'DELETE' });
-      return sendJson(res, 200, { ok: true });
+      const sid = decodeURIComponent(mDel[1]);
+      const upstream = await api(`/sessions/${sid}`, { method: 'DELETE' });
+      const cardsDropped = await journal.dropSession(sid).catch((e) => {
+        console.error('[cards] 清会话卡片失败', e.message);
+        return 0;
+      });
+      console.log(`[sessions] 删除 ${sid}，卡片 ${cardsDropped} 条`);
+      return sendJson(res, 200, {
+        success: upstream?.success !== false,
+        cardsDropped,
+      });
     }
     const mHist = p.match(/^\/api\/sessions\/([^/]+)\/events$/);
     if (mHist) {

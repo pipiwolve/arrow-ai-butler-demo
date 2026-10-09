@@ -399,6 +399,7 @@ curl -H "Authorization: bearer <token>" -H "appPlatform: arrow" \
 | 改 Agent | `POST /agents/{id}` 带 `version` 乐观锁，只带变动的字段（`system` / `skills`）。`agentId` 不变，历史会话跟着保留 |
 | Session + SSE | 每次提问建一个会话，全过程流式回传；追问复用同一会话 |
 | 会话历史 | `GET /sessions/{id}/events` 拉完整历史，关掉页面再打开能接着看。闸门与执行卡不在平台消息里，由本层另存在 `cards.jsonl`，与历史一并返回 |
+| 删除会话 | `DELETE /sessions/{session_id}` 删会话元数据及沙箱。侧栏「删除」按两下确认后走 `DELETE /api/sessions/:id`，同时清掉该会话的卡片流水。审计流水不删 |
 | 产物 | `file_export` 工具 part 给出本轮导出的文件；跨会话汇总走 `GET /sessions/{id}/artifact/path-map`（不传 `path` 返回该会话全部产物，带临时签名地址） |
 | 建 Agent | 人设与口径写在 `config/scenario.json` 的 `agent.system`（上限 1000 字符） |
 

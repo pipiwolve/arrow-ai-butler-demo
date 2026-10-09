@@ -1367,7 +1367,7 @@ function paintSessions() {
   }
 }
 
-// 平台没有「归档」。删除是 DELETE /sessions/{id}，会话从列表里消失。
+// 文档接口 DELETE /sessions/{session_id}：删掉会话元数据和沙箱。
 // 按两下才发出去，避免侧栏里误点。
 function sessionDeleteBtn(s) {
   const b = el('button', 'sdel', '删除');

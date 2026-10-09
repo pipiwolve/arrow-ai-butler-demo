@@ -8,7 +8,8 @@
 //   配了 KV_REST_API_URL + KV_REST_API_TOKEN → Redis（Vercel KV / Upstash 都是这套 REST 接口）
 //   没配                                      → 本地文件，行为与改动前完全一致
 //
-// 两个后端的语义对齐在「追加 + 倒序取尾部 + 全量取」这三件事上，够 audit 与 journal 用。
+// 两个后端的语义对齐在「追加 + 倒序取尾部 + 全量取 + 整表覆盖」上。
+// 覆盖给删会话用：卡片流水按 sessionId 筛掉再写回，审计流水不动。
 
 import fs from 'node:fs';
 
@@ -42,6 +43,18 @@ function createRedisStore({ url, token, key }) {
       const list = await cmd('LRANGE', key, -n, -1);
       return Array.isArray(list) ? list.reverse() : [];
     },
+    // 先写临时键再改名，替换失败时旧列表还在。空列表直接删键：
+    // 临时键不存在时 RENAME 会失败。
+    async replaceAll(lines) {
+      if (!lines.length) {
+        await cmd('DEL', key);
+        return;
+      }
+      const tmp = `${key}:swap`;
+      await cmd('DEL', tmp);
+      await cmd('RPUSH', tmp, ...lines);
+      await cmd('RENAME', tmp, key);
+    },
     async readJson(dflt) {
       const v = await cmd('GET', key);
       if (!v) return dflt;
@@ -70,6 +83,9 @@ function createFileStore({ file }) {
     // 倒序读最近的 n 条。文件不大，直接全读再切
     async tail(n) {
       return lines().slice(-n).reverse();
+    },
+    async replaceAll(next) {
+      fs.writeFileSync(file, next.length ? next.join('\n') + '\n' : '');
     },
     async readJson(dflt) {
       try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : dflt; } catch { return dflt; }
