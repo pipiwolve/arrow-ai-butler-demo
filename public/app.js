@@ -925,11 +925,12 @@ async function ask(text) {
 
   const ctl = new AbortController();
   T.ctl = ctl;
+  const priorText = [...streamEl.querySelectorAll('.u')].map((n) => n.textContent.trim()).filter(Boolean).at(-2) || '';
   try {
     const res = await fetch('/api/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, sessionId: T.sid || undefined }),
+      body: JSON.stringify({ text, sessionId: T.sid || undefined, priorText }),
       signal: ctl.signal,
     });
     if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);

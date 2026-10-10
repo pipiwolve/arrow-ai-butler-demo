@@ -871,8 +871,9 @@ async function handleAsr(req, res) {
 
 // ---------- POST /api/ask ----------
 async function handleAsk(req, res) {
-  const { text = '', sessionId } = await readBody(req);
+  const { text = '', sessionId, priorText = '' } = await readBody(req);
   const q = String(text).trim();
+  const prior = String(priorText || '').trim();
   if (!q) return sendJson(res, 400, { error: 'text 不能为空' });
 
   const st = await bootstrap();
@@ -961,7 +962,7 @@ async function handleAsk(req, res) {
         toClient('demo.done', { sessionId: sid, incomplete: !complete });
         return;
       }
-      const guessed = inferControl(q, priorUserText(modelText));
+      const guessed = inferControl(q, prior || priorUserText(modelText));
       if (guessed?.action) resolved = guessed;
       else if (guessed?.ambiguous) {
         const hits = guessed.ambiguous;
