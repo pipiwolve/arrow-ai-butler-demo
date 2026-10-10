@@ -962,7 +962,7 @@ async function handleAsk(req, res) {
         toClient('demo.done', { sessionId: sid, incomplete: !complete });
         return;
       }
-      const guessed = inferControl(q, prior || priorUserText(modelText));
+      const guessed = inferControl([q, prior, priorUserText(modelText), clean].filter(Boolean).join('\n'), prior || priorUserText(modelText));
       if (guessed?.action) resolved = guessed;
       else if (guessed?.ambiguous) {
         const hits = guessed.ambiguous;
