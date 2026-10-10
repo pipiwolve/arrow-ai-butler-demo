@@ -675,6 +675,49 @@ async function execute(rec, { trigger, actor = 'app-user', sessionId }) {
   return { ...entry, ok: res.ok };
 }
 
+// 模型经常把动作写成一句中文，不附 iot 块。设备能唯一确定时，由这里组出控制动作再下发。
+function inferControl(q) {
+  const text = String(q || '');
+  if (!/打开|关闭|开启|关掉|开机|关机|夜灯|大冲|进水|翻盖|脚触|润瓷/.test(text)) return null;
+  const room = /主卫/.test(text) ? '主卫' : /客卫/.test(text) ? '客卫' : '';
+  let cats = null;
+  let cmd = '';
+  if (/大冲|冲水/.test(text)) { cats = new Set(['01']); cmd = 'switch_watering'; }
+  else if (/翻盖/.test(text)) { cats = new Set(['01']); cmd = 'switch_auto_closing'; }
+  else if (/脚触/.test(text)) { cats = new Set(['01']); cmd = 'switch_kicking'; }
+  else if (/润瓷/.test(text)) { cats = new Set(['01']); cmd = 'switch_auto_oiling_porcelain'; }
+  else if (/进水|放水/.test(text)) { cats = new Set(['04']); cmd = 'switch_water_in'; }
+  else if (/夜灯/.test(text)) { cats = new Set(['01', '06']); cmd = 'switch_night_light'; }
+  else if (/镜柜/.test(text)) { cats = new Set(['06']); cmd = 'switch_onoff'; }
+  else if (/浴缸/.test(text)) { cats = new Set(['04']); cmd = 'switch_onoff'; }
+  else if (/马桶|坐便/.test(text)) { cats = new Set(['01']); cmd = 'switch_onoff'; }
+  if (!cmd) return null;
+
+  const spec = SCENARIO.commands.find((c) => c.cmd === cmd);
+  const allowed = spec?.params?.switch || [];
+  const wantOff = /关闭|关掉|关机/.test(text) && !/打开|开启|开机/.test(text);
+  const value = wantOff ? 'off' : 'on';
+  if (!allowed.includes(value)) return null;
+
+  const pool = DEVICES.devices.filter((d) => (!room || d.room === room) && (!cats || cats.has(d.categoryCode)));
+  const named = pool.filter((d) => {
+    const tag = String(d.deviceTagName || '');
+    const name = String(d.deviceName || '');
+    if (tag && text.includes(tag)) return true;
+    if (name && text.includes(name)) return true;
+    const model = tag.match(/AKB\d+|ACH\d+|QN-PRO/i)?.[0];
+    return !!(model && text.toUpperCase().includes(model.toUpperCase()));
+  });
+  const hits = named.length ? named : pool;
+  if (hits.length !== 1) return { ambiguous: hits };
+  const dev = hits[0];
+  return {
+    action: 'device.control',
+    targets: [{ deviceName: dev.deviceName, cmd, param: 'switch', value }],
+    say: `准备向${dev.room || ''} ${dev.deviceTagName || dev.deviceName} 发送 ${cmd}`,
+  };
+}
+
 // 模型没交出 iot 块时，不要一律说「请指定其中一台」。
 // 暖风、座温这类平台不认的功能，和主卫两台镜柜没选中，是两种回答。
 function missingCommandNote(q) {
@@ -709,7 +752,7 @@ function missingCommandNote(q) {
 // 模型有时不输出 iot 块，却在正文里写「已下发，上线后生效」。
 // 这类句子出现时，平台其实没收到请求，必须用回执盖掉。
 function claimsDispatch(text) {
-  return /已下发|已为你下发|照常下发|正常下发|已经执行|已执行|恢复在线后生效|上线后生效|上线后再生效/.test(String(text || ''));
+  return /已下发|已为你下发|照常下发|正常下发|已经执行|已执行|恢复在线后生效|上线后生效|上线后再生效|发送到物联网平台|向平台发送/.test(String(text || ''));
 }
 
 // 模型的正文写在请求之前，不能当结果。这句用网关的 HTTP 状态和 msg 补上。
@@ -887,11 +930,27 @@ async function handleAsk(req, res) {
       });
     };
 
-    if (!action) {
+    let resolved = action;
+    if (!resolved) {
       const inferred = repairKindFrom(clean);
-      if (inferred) await openRepair(inferred, q);
-      else if (claimsDispatch(clean)) {
-        card('demo.note', { text: '上面那段是助手的预测，物联网平台没有收到指令。离线设备被平台当场拒绝，上线后也不会补做。' });
+      if (inferred) {
+        await openRepair(inferred, q);
+        toClient('demo.done', { sessionId: sid, incomplete: !complete });
+        return;
+      }
+      const guessed = inferControl(q);
+      if (guessed?.action) resolved = guessed;
+      else if (guessed?.ambiguous) {
+        const hits = guessed.ambiguous;
+        const names = hits.slice(0, 4).map((d) => `${d.room ? d.room + ' ' : ''}${d.deviceTagName}`).join('、');
+        card('demo.note', { text: `有 ${hits.length} 台符合：${names}${hits.length > 4 ? ' 等' : ''}。请指定其中一台。本次没有向物联网平台发送指令。` });
+        toClient('demo.done', { sessionId: sid, incomplete: !complete });
+        return;
+      }
+    }
+    if (!resolved) {
+      if (claimsDispatch(clean)) {
+        card('demo.note', { text: '上面那段是助手的预测。本次没有向物联网平台发送指令。' });
       } else {
         const note = missingCommandNote(q);
         if (note) card('demo.note', { text: note });
@@ -900,18 +959,18 @@ async function handleAsk(req, res) {
       return;
     }
 
-    toClient('demo.action', { action: action.action, raw: action });
+    toClient('demo.action', { action: resolved.action, raw: resolved });
 
     // 报修只给 deeplink，没有副作用，不用过闸门
-    if (action.action === 'repair.open') {
-      const kind = action.kind === 'progress' ? 'progress' : 'report';
-      await openRepair(kind, action.say || q);
+    if (resolved.action === 'repair.open') {
+      const kind = resolved.kind === 'progress' ? 'progress' : 'report';
+      await openRepair(kind, resolved.say || q);
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
     }
 
     const verdict = gate.evaluate(
-      { ...action, homeId: action.homeId ?? SCENARIO.iot.homeId },
+      { ...resolved, homeId: resolved.homeId ?? SCENARIO.iot.homeId },
       { online: await onlineForGate() },
     );
     card('demo.gate', {
