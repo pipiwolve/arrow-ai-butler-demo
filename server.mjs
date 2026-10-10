@@ -176,7 +176,7 @@ function turnContext(live) {
       const caps = capsFor(d.categoryCode);
       lines.push(`- ${room ? room + ' ' : ''}${d.deviceTagName || ''} ${d.deviceName} ${d.onlineStatus ? '在线' : '离线'} 可用 ${caps.join('、') || '无'}`);
     }
-    lines.push('用户已指定唯一一台时，必须输出 iot 动作，离线也要下发。有多台命中时只反问，不要输出动作，也不要说两台都发。');
+    lines.push('用户已指定唯一一台时，必须输出 iot 动作。离线也要输出动作，正文只能写准备向平台发送。不要写已下发、已执行或上线后生效：平台会拒绝离线设备，不会排队补发。有多台命中时只反问，不要输出动作。');
   }
   lines.push('指令（参数名都是 switch，取值逐字使用）：');
   for (const c of SCENARIO.commands) {
@@ -706,6 +706,12 @@ function missingCommandNote(q) {
   return '没有形成可下发指令，物联网平台没有收到请求。';
 }
 
+// 模型有时不输出 iot 块，却在正文里写「已下发，上线后生效」。
+// 这类句子出现时，平台其实没收到请求，必须用回执盖掉。
+function claimsDispatch(text) {
+  return /已下发|已为你下发|照常下发|正常下发|已经执行|已执行|恢复在线后生效|上线后生效|上线后再生效/.test(String(text || ''));
+}
+
 // 模型的正文写在请求之前，不能当结果。这句用网关的 HTTP 状态和 msg 补上。
 function controlReceipt(out) {
   const http = out.httpStatus ? `HTTP ${out.httpStatus}` : '';
@@ -717,6 +723,9 @@ function controlReceipt(out) {
     .join('、');
   if (!out.ok) return `没有发到物联网平台。${http || out.error || '请求失败'}。`;
   if (accepted) return `已下发${who ? '：' + who : ''}。平台 ${http}，已受理。`;
+  if (/设备离线/.test(msg)) {
+    return `已请求物联网平台${who ? '：' + who : ''}。平台 ${http}，返回「设备离线」，并拒绝了这条指令。设备没有执行，上线后也不会补做这一次。`;
+  }
   return `已请求物联网平台${who ? '：' + who : ''}。平台 ${http}${msg ? '，返回「' + msg + '」' : ''}。指令没有在设备上执行。`;
 }
 
@@ -881,7 +890,9 @@ async function handleAsk(req, res) {
     if (!action) {
       const inferred = repairKindFrom(clean);
       if (inferred) await openRepair(inferred, q);
-      else {
+      else if (claimsDispatch(clean)) {
+        card('demo.note', { text: '上面那段是助手的预测，物联网平台没有收到指令。离线设备被平台当场拒绝，上线后也不会补做。' });
+      } else {
         const note = missingCommandNote(q);
         if (note) card('demo.note', { text: note });
       }
@@ -914,6 +925,7 @@ async function handleAsk(req, res) {
         decision: 'DENIED', trigger: 'gate', reasons: verdict.reasons,
         targets: verdict.items || [], result: 'BLOCKED',
       });
+      card('demo.note', { text: `没有向物联网平台发送指令。${verdict.reasons.join('；')}` });
       toClient('demo.done', { sessionId: sid, incomplete: !complete });
       return;
     }

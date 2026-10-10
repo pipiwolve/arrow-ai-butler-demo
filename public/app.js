@@ -170,6 +170,8 @@ function stepOf(r, live, answerId, t) {
     if (t.userMsgs.has(r.messageID) || flat(spokenText(partText(r))) === t.userText) return null;
     const txt = plain(spokenText(partText(r)));
     if (!txt) return null;
+    // 回执到达后，把「已下发、上线后生效」这类预测从执行过程里拿掉，避免盖过平台结果
+    if (t?.receipt && /下发|已执行|已经执行|照常|生效|恢复在线/.test(txt)) return null;
     s = { k: 'say', label: clip(txt, 56), raw: spokenText(partText(r)) };
   } else if (r.type === 'reasoning') s = { k: 'think', label: '思考', raw: '' };
   else if (r.type === 'subtask' || r.type === 'agent') s = { k: 'task', label: '派子任务', raw: '' };
@@ -524,9 +526,9 @@ function addExecCard(t, out) {
 // 模型正文写在请求之前。结果句以平台回执为准；原先那句「我会下发」就换掉。
 function applyReceipt(t, text) {
   if (!text) return;
-  const prev = t.override != null ? t.override : answerText(t);
-  const noisy = /下发|已发送|都会发送|开启成功|正常下发|已经执行|已执行/.test(prev);
-  t.override = noisy ? text : [prev, text].filter(Boolean).join('\n\n');
+  t.receipt = text;
+  // 平台回执到达后，结论只留回执。模型那段写在请求之前，留着会把「已下发」说成结果。
+  t.override = text;
   paint(t);
 }
 
