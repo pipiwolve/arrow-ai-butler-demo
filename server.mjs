@@ -676,10 +676,13 @@ async function execute(rec, { trigger, actor = 'app-user', sessionId }) {
 }
 
 // 模型经常把动作写成一句中文，不附 iot 块。设备能唯一确定时，由这里组出控制动作再下发。
-function inferControl(q) {
-  const text = String(q || '');
+function inferControl(q, prior = '') {
+  const current = String(q || '');
+  const earlier = String(prior || '');
+  const text = `${earlier}\n${current}`;
   if (!/打开|关闭|开启|关掉|开机|关机|夜灯|大冲|进水|翻盖|脚触|润瓷/.test(text)) return null;
-  const room = /主卫/.test(text) ? '主卫' : /客卫/.test(text) ? '客卫' : '';
+  const room = /主卫/.test(current) ? '主卫' : /客卫/.test(current) ? '客卫'
+    : /主卫/.test(earlier) ? '主卫' : /客卫/.test(earlier) ? '客卫' : '';
   let cats = null;
   let cmd = '';
   if (/大冲|冲水/.test(text)) { cats = new Set(['01']); cmd = 'switch_watering'; }
@@ -695,7 +698,9 @@ function inferControl(q) {
 
   const spec = SCENARIO.commands.find((c) => c.cmd === cmd);
   const allowed = spec?.params?.switch || [];
-  const wantOff = /关闭|关掉|关机/.test(text) && !/打开|开启|开机/.test(text);
+  const wantOff = /关闭|关掉|关机/.test(current)
+    ? !/打开|开启|开机/.test(current)
+    : /关闭|关掉|关机/.test(earlier) && !/打开|开启|开机/.test(earlier);
   const value = wantOff ? 'off' : 'on';
   if (!allowed.includes(value)) return null;
 
@@ -703,12 +708,20 @@ function inferControl(q) {
   const named = pool.filter((d) => {
     const tag = String(d.deviceTagName || '');
     const name = String(d.deviceName || '');
+    if (tag && current.includes(tag)) return true;
+    if (name && current.includes(name)) return true;
+    const model = tag.match(/AKB\d+|ACH\d+|QN-PRO/i)?.[0];
+    return !!(model && current.toUpperCase().includes(model.toUpperCase()));
+  });
+  const inherited = named.length ? [] : pool.filter((d) => {
+    const tag = String(d.deviceTagName || '');
+    const name = String(d.deviceName || '');
     if (tag && text.includes(tag)) return true;
     if (name && text.includes(name)) return true;
     const model = tag.match(/AKB\d+|ACH\d+|QN-PRO/i)?.[0];
     return !!(model && text.toUpperCase().includes(model.toUpperCase()));
   });
-  const hits = named.length ? named : pool;
+  const hits = named.length ? named : (inherited.length ? inherited : pool);
   if (hits.length !== 1) return { ambiguous: hits };
   const dev = hits[0];
   return {
@@ -716,6 +729,16 @@ function inferControl(q) {
     targets: [{ deviceName: dev.deviceName, cmd, param: 'switch', value }],
     say: `准备向${dev.room || ''} ${dev.deviceTagName || dev.deviceName} 发送 ${cmd}`,
   };
+}
+
+// 用户接着上一句只回型号时，本轮原文里没有「大冲」。
+// 模型回答里不一定回显上一句，发给它的上下文里有。取倒数第二条用户原话。
+function priorUserText(modelText) {
+  const parts = String(modelText || '').split(ROSTER_MARK);
+  if (parts.length < 3) return '';
+  const chunk = parts[parts.length - 2];
+  const line = chunk.split('\n').map((s) => s.trim()).find(Boolean) || '';
+  return line.replace(/【本轮设备】[\s\S]*$/, '').trim();
 }
 
 // 模型没交出 iot 块时，不要一律说「请指定其中一台」。
@@ -938,7 +961,7 @@ async function handleAsk(req, res) {
         toClient('demo.done', { sessionId: sid, incomplete: !complete });
         return;
       }
-      const guessed = inferControl(q);
+      const guessed = inferControl(q, priorUserText(modelText));
       if (guessed?.action) resolved = guessed;
       else if (guessed?.ambiguous) {
         const hits = guessed.ambiguous;
