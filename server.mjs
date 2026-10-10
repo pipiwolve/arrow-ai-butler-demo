@@ -721,8 +721,9 @@ function inferControl(q, prior = '') {
     const model = tag.match(/AKB\d+|ACH\d+|QN-PRO/i)?.[0];
     return !!(model && text.toUpperCase().includes(model.toUpperCase()));
   });
+  // 这一句已经点了名，就只认这一句。模型回答里再提到另一台，不能把命中数加回去。
   const hits = named.length ? named : (inherited.length ? inherited : pool);
-  if (hits.length !== 1) return { ambiguous: hits };
+  if (hits.length !== 1) return { ambiguous: hits, cmd, param: 'switch', value };
   const dev = hits[0];
   return {
     action: 'device.control',
@@ -962,12 +963,16 @@ async function handleAsk(req, res) {
         toClient('demo.done', { sessionId: sid, incomplete: !complete });
         return;
       }
-      const guessed = inferControl([q, prior, priorUserText(modelText), clean].filter(Boolean).join('\n'), prior || priorUserText(modelText));
+      const guessed = inferControl(q, prior || priorUserText(modelText));
       if (guessed?.action) resolved = guessed;
-      else if (guessed?.ambiguous) {
-        const hits = guessed.ambiguous;
-        const names = hits.slice(0, 4).map((d) => `${d.room ? d.room + ' ' : ''}${d.deviceTagName}`).join('、');
-        card('demo.note', { text: `有 ${hits.length} 台符合：${names}${hits.length > 4 ? ' 等' : ''}。请指定其中一台。本次没有向物联网平台发送指令。` });
+      else if (guessed?.ambiguous?.length) {
+        card('demo.pick', {
+          cmd: guessed.cmd, param: guessed.param || 'switch', value: guessed.value,
+          options: guessed.ambiguous.slice(0, 6).map((d) => ({
+            deviceName: d.deviceName,
+            label: `${d.room ? d.room + ' ' : ''}${d.deviceTagName || d.deviceName}`,
+          })),
+        });
         toClient('demo.done', { sessionId: sid, incomplete: !complete });
         return;
       }
@@ -1079,6 +1084,39 @@ async function handleSimulate(req, res) {
     decision: verdict.decision, level: verdict.level, reasons: verdict.reasons,
     items: verdict.items || [], dryRun: true,
   });
+}
+
+// ---------- POST /api/dispatch ----------
+// 多台命中时，页面上的选择按钮走这里。设备号由用户点选，不再把这句话交回模型重猜。
+async function handleDispatch(req, res) {
+  const body = await readBody(req);
+  const deviceName = String(body.deviceName || '');
+  const cmd = String(body.cmd || '');
+  const param = String(body.param || 'switch');
+  const value = String(body.value || '');
+  const dev = DEVICES.devices.find((d) => d.deviceName === deviceName);
+  const spec = SCENARIO.commands.find((c) => c.cmd === cmd);
+  const allowed = spec?.params?.[param] || [];
+  if (!dev || !spec || !allowed.includes(value) || !(spec.appliesTo || []).includes(dev.categoryCode)) {
+    return sendJson(res, 400, { error: '设备或指令不在可下发范围内' });
+  }
+  const action = {
+    action: 'device.control',
+    homeId: SCENARIO.iot.homeId,
+    targets: [{ deviceName, cmd, param, value }],
+    say: `向${dev.room || ''} ${dev.deviceTagName || deviceName} 发送 ${cmd}`,
+  };
+  const verdict = gate.evaluate(action, { online: await onlineForGate() });
+  if (verdict.decision === 'deny') {
+    return sendJson(res, 409, { error: verdict.reasons.join('；'), decision: 'deny', reasons: verdict.reasons });
+  }
+  if (verdict.decision === 'confirm') {
+    return sendJson(res, 200, {
+      decision: 'confirm', pendingId: verdict.pendingId, level: verdict.level, reasons: verdict.reasons, items: verdict.items,
+    });
+  }
+  const out = await execute(verdict, { trigger: 'gate-pick', sessionId: body.sessionId || '' });
+  return sendJson(res, 200, { decision: 'allow', exec: redact(out) });
 }
 
 // ---------- POST /api/confirm ----------
@@ -1341,6 +1379,7 @@ export async function handler(req, res) {
     if (p === '/api/asr' && req.method === 'POST') return await handleAsr(req, res);
     if (p === '/api/gate/simulate' && req.method === 'POST') return await handleSimulate(req, res);
     if (p === '/api/confirm' && req.method === 'POST') return await handleConfirm(req, res);
+    if (p === '/api/dispatch' && req.method === 'POST') return await handleDispatch(req, res);
 
     if (p === '/api/sessions') {
       const list = await listSessions();

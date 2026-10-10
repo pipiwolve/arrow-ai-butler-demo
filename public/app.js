@@ -882,6 +882,9 @@ function handleEvent(ev, d, t) {
     case 'demo.note':
       applyReceipt(t, d?.text);
       break;
+    case 'demo.pick':
+      addDevicePick(t, d);
+      break;
     case 'demo.repair':
       addRepairCard(t, d);
       loadAuditCount();
@@ -1075,6 +1078,7 @@ function replayCards(turns, recs) {
         if (r.event === 'demo.gate') addGateCard(t, r.data, true);
         else if (r.event === 'demo.exec') addExecCard(t, r.data);
         else if (r.event === 'demo.note') applyReceipt(t, r.data?.text);
+        else if (r.event === 'demo.pick') addDevicePick(t, r.data);
         else if (r.event === 'demo.repair') addRepairCard(t, r.data);
         // 落盘的是没带下载地址的那份，回看时点「获取下载地址」现取。
         // sessionId 只在回合记录里有：早先写下的流水里那张卡是光秃秃的，
@@ -1120,6 +1124,59 @@ function addReserveCard(t, d) {
   if (d.payload) card.append(el('pre', 'raw', d.payload));
   t.cardsEl.append(card);
   scrollBottom();
+}
+
+function addDevicePick(t, d) {
+  const card = el('div', 'reserve');
+  const h = el('div', 'reserve-h');
+  h.append(el('b', null, '选择要控制的设备'));
+  card.append(h);
+  card.append(el('p', null, '有多台符合。点一台后，这条指令才会发到物联网平台。'));
+  const picks = el('div', 'picks');
+  for (const opt of d.options || []) {
+    const b = el('button', null, opt.label);
+    b.type = 'button';
+    b.onclick = () => dispatchPick(t, d, opt, picks, b);
+    picks.append(b);
+  }
+  card.append(picks);
+  t.cardsEl.append(card);
+  scrollBottom();
+}
+
+async function dispatchPick(t, d, opt, picks, button) {
+  for (const x of picks.querySelectorAll('button')) x.disabled = true;
+  button.classList.add('on');
+  try {
+    const res = await fetch('/api/dispatch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: T.sid || '',
+        deviceName: opt.deviceName,
+        cmd: d.cmd,
+        param: d.param || 'switch',
+        value: d.value,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      applyReceipt(t, data.error || '没有向物联网平台发送指令。');
+      return;
+    }
+    if (data.decision === 'confirm') {
+      addGateCard(t, data);
+      t.pendings.set(data.pendingId, t.cardsEl.lastElementChild);
+      return;
+    }
+    if (data.exec) {
+      addExecCard(t, data.exec);
+      loadAuditCount();
+      loadDevices(true);
+    }
+  } catch (e) {
+    applyReceipt(t, String(e?.message || e));
+  }
 }
 
 function addPickCard(t, d) {
